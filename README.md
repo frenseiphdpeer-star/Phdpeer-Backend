@@ -42,8 +42,8 @@ A production-ready platform for managing and optimizing PhD research timelines w
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
-   cd Frensei-Engine
+   git clone https://github.com/frenseiphdpeer-star/Phdpeer-Backend.git
+   cd Phdpeer-Backend
    ```
 
 2. **Start with Docker Compose**
