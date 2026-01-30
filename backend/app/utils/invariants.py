@@ -2,12 +2,13 @@
 System invariants and validation utilities.
 
 Enforces critical system constraints:
-1. No committed timeline without draft
-2. No PhD Doctor score without submission
-3. No progress event without committed milestone
-4. No duplicate idempotent actions
+1. No duplicate execution for same request_id (global)
+2. No state mutation outside orchestrators
+3. No committed timeline without draft
+4. No PhD Doctor score without submission
+5. No progress event without committed milestone
 
-Fail fast with clear errors.
+Fail fast with explicit errors.
 """
 
 from typing import Optional
@@ -51,6 +52,20 @@ class DuplicateIdempotentActionError(InvariantViolationError):
     
     def __init__(self, message: str, details: dict = None):
         super().__init__("duplicate_idempotent_action", message, details)
+
+
+class DuplicateExecutionError(InvariantViolationError):
+    """Raised when duplicate execution detected for same request_id."""
+    
+    def __init__(self, message: str, details: dict = None):
+        super().__init__("duplicate_execution", message, details)
+
+
+class StateMutationOutsideOrchestratorError(InvariantViolationError):
+    """Raised when state mutation attempted outside orchestrator."""
+    
+    def __init__(self, message: str, details: dict = None):
+        super().__init__("state_mutation_outside_orchestrator", message, details)
 
 
 class InvariantChecker:
@@ -259,9 +274,66 @@ class InvariantChecker:
                 }
             )
     
+    def check_no_duplicate_execution(
+        self,
+        request_id: str,
+        orchestrator_name: str,
+        allow_completed: bool = False
+    ) -> None:
+        """
+        Global invariant: No duplicate execution for same request_id.
+        
+        Prevents duplicate execution across all orchestrators.
+        This is a global check that enforces idempotency at the system level.
+        
+        Args:
+            request_id: Request identifier (idempotency key)
+            orchestrator_name: Orchestrator name
+            allow_completed: If True, allow completed requests (they return cached results)
+            
+        Raises:
+            DuplicateExecutionError: If duplicate execution detected
+        """
+        from app.models.idempotency import IdempotencyKey, RequestStatus
+        from sqlalchemy import and_
+        
+        existing = self.db.query(IdempotencyKey).filter(
+            and_(
+                IdempotencyKey.request_id == request_id,
+                IdempotencyKey.orchestrator_name == orchestrator_name
+            )
+        ).first()
+        
+        if not existing:
+            return  # No duplicate found
+        
+        if existing.status == RequestStatus.PROCESSING:
+            raise DuplicateExecutionError(
+                f"Duplicate execution detected: request_id '{request_id}' is already being processed by '{orchestrator_name}'",
+                details={
+                    "request_id": request_id,
+                    "orchestrator_name": orchestrator_name,
+                    "status": existing.status.value,
+                    "started_at": existing.started_at.isoformat() if existing.started_at else None,
+                    "hint": "Wait for operation to complete or use a different request_id"
+                }
+            )
+        
+        if existing.status == RequestStatus.COMPLETED and not allow_completed:
+            raise DuplicateExecutionError(
+                f"Duplicate execution detected: request_id '{request_id}' was already completed by '{orchestrator_name}'",
+                details={
+                    "request_id": request_id,
+                    "orchestrator_name": orchestrator_name,
+                    "status": existing.status.value,
+                    "completed_at": existing.completed_at.isoformat() if existing.completed_at else None,
+                    "hint": "Use the cached result or use a different request_id"
+                }
+            )
+    
     def check_idempotency_key_unique(
         self,
-        key: str,
+        request_id: str,
         orchestrator_name: str,
         allow_completed: bool = True
     ) -> Optional[dict]:
@@ -272,7 +344,7 @@ class InvariantChecker:
         duplicate execution. Returns existing result if key exists and completed.
         
         Args:
-            key: Idempotency key
+            request_id: Request identifier (idempotency key)
             orchestrator_name: Orchestrator name
             allow_completed: If True, return cached result for completed operations
             
@@ -282,35 +354,38 @@ class InvariantChecker:
         Raises:
             DuplicateIdempotentActionError: If key exists but not completed
         """
-        from app.models.idempotency import IdempotencyKey
+        from app.models.idempotency import IdempotencyKey, RequestStatus
+        from sqlalchemy import and_
         
         existing = self.db.query(IdempotencyKey).filter(
-            IdempotencyKey.key == key,
-            IdempotencyKey.orchestrator_name == orchestrator_name
+            and_(
+                IdempotencyKey.request_id == request_id,
+                IdempotencyKey.orchestrator_name == orchestrator_name
+            )
         ).first()
         
         if not existing:
             return None
         
         # If completed and allowed, return cached result
-        if existing.status == "COMPLETED" and allow_completed:
-            return existing.result_data
+        if existing.status == RequestStatus.COMPLETED and allow_completed:
+            return existing.response_data
         
         # If in progress, fail
-        if existing.status == "IN_PROGRESS":
+        if existing.status == RequestStatus.PROCESSING:
             raise DuplicateIdempotentActionError(
-                f"Operation with key '{key}' is already in progress",
+                f"Operation with request_id '{request_id}' is already in progress",
                 details={
-                    "key": key,
+                    "request_id": request_id,
                     "orchestrator_name": orchestrator_name,
-                    "status": existing.status,
-                    "started_at": existing.created_at.isoformat() if existing.created_at else None,
+                    "status": existing.status.value,
+                    "started_at": existing.started_at.isoformat() if existing.started_at else None,
                     "hint": "Wait for operation to complete or use a different request_id"
                 }
             )
         
         # If failed, allow retry with same key
-        if existing.status == "FAILED":
+        if existing.status == RequestStatus.FAILED:
             # Delete failed attempt to allow retry
             self.db.delete(existing)
             self.db.flush()
@@ -318,11 +393,11 @@ class InvariantChecker:
         
         # Other statuses - treat as error
         raise DuplicateIdempotentActionError(
-            f"Operation with key '{key}' exists with unexpected status: {existing.status}",
+            f"Operation with request_id '{request_id}' exists with unexpected status: {existing.status.value}",
             details={
-                "key": key,
+                "request_id": request_id,
                 "orchestrator_name": orchestrator_name,
-                "status": existing.status
+                "status": existing.status.value
             }
         )
     
@@ -362,15 +437,85 @@ class InvariantChecker:
         
         elif operation == "check_idempotency":
             result = self.check_idempotency_key_unique(
-                key=context["key"],
+                request_id=context["request_id"],
                 orchestrator_name=context["orchestrator_name"],
                 allow_completed=context.get("allow_completed", True)
             )
             return result
         
+        elif operation == "check_duplicate_execution":
+            self.check_no_duplicate_execution(
+                request_id=context["request_id"],
+                orchestrator_name=context["orchestrator_name"]
+            )
+        
+        elif operation == "check_state_mutation":
+            self.check_no_state_mutation_outside_orchestrator(
+                operation=context["operation"],
+                caller_context=context.get("caller_context", {})
+            )
+        
         else:
             # Unknown operation - no checks
             pass
+    
+    def check_no_state_mutation_outside_orchestrator(
+        self,
+        operation: str,
+        caller_context: dict
+    ) -> None:
+        """
+        Invariant: No state mutation outside orchestrators.
+        
+        Ensures that state-changing operations (create, update, delete)
+        are only performed through orchestrators, not directly.
+        
+        Args:
+            operation: Operation name (e.g., "create_baseline", "update_timeline")
+            caller_context: Context about the caller (stack trace, module, etc.)
+            
+        Raises:
+            StateMutationOutsideOrchestratorError: If mutation attempted outside orchestrator
+        """
+        import inspect
+        import traceback
+        
+        # Get the call stack
+        stack = inspect.stack()
+        
+        # Check if we're being called from an orchestrator
+        is_orchestrator = False
+        caller_module = None
+        caller_function = None
+        
+        for frame_info in stack[2:6]:  # Skip current frame and immediate caller
+            frame = frame_info.frame
+            module_name = frame.f_globals.get('__name__', '')
+            function_name = frame_info.function
+            
+            if 'orchestrator' in module_name.lower() or 'orchestrator' in function_name.lower():
+                is_orchestrator = True
+                caller_module = module_name
+                caller_function = function_name
+                break
+        
+        if not is_orchestrator:
+            # Get more context about the caller
+            caller_frame = stack[2] if len(stack) > 2 else None
+            if caller_frame:
+                caller_module = caller_frame.frame.f_globals.get('__name__', 'unknown')
+                caller_function = caller_frame.function
+            
+            raise StateMutationOutsideOrchestratorError(
+                f"State mutation '{operation}' attempted outside orchestrator",
+                details={
+                    "operation": operation,
+                    "caller_module": caller_module,
+                    "caller_function": caller_function,
+                    "hint": f"Use an orchestrator to perform '{operation}' instead of direct database access",
+                    "context": caller_context
+                }
+            )
 
 
 # Convenience functions for direct usage
@@ -408,10 +553,107 @@ def check_progress_event_has_milestone(
 
 def check_idempotency_key_unique(
     db: Session,
-    key: str,
+    request_id: str,
     orchestrator_name: str,
     allow_completed: bool = True
 ) -> Optional[dict]:
     """Check idempotency key unique invariant."""
     checker = InvariantChecker(db)
-    return checker.check_idempotency_key_unique(key, orchestrator_name, allow_completed)
+    return checker.check_idempotency_key_unique(request_id, orchestrator_name, allow_completed)
+
+
+def check_no_duplicate_execution(
+    db: Session,
+    request_id: str,
+    orchestrator_name: str,
+    allow_completed: bool = False
+) -> None:
+    """
+    Global invariant: No duplicate execution for same request_id.
+    
+    Utility helper for checking duplicate execution across orchestrators.
+    Fail fast with explicit error.
+    
+    Args:
+        db: Database session
+        request_id: Request identifier
+        orchestrator_name: Orchestrator name
+        allow_completed: If True, allow completed requests (they return cached results)
+        
+    Raises:
+        DuplicateExecutionError: If duplicate execution detected
+    """
+    checker = InvariantChecker(db)
+    checker.check_no_duplicate_execution(request_id, orchestrator_name, allow_completed)
+
+
+def check_no_state_mutation_outside_orchestrator(
+    db: Session,
+    operation: str,
+    caller_context: dict = None
+) -> None:
+    """
+    Invariant: No state mutation outside orchestrators.
+    
+    Utility helper for ensuring state mutations only happen in orchestrators.
+    Fail fast with explicit error.
+    
+    Args:
+        db: Database session
+        operation: Operation name
+        caller_context: Optional context about the caller
+        
+    Raises:
+        StateMutationOutsideOrchestratorError: If mutation attempted outside orchestrator
+    """
+    checker = InvariantChecker(db)
+    checker.check_no_state_mutation_outside_orchestrator(
+        operation,
+        caller_context or {}
+    )
+
+
+def validate_request_id(request_id: str) -> None:
+    """
+    Utility helper: Validate request_id format.
+    
+    Args:
+        request_id: Request identifier to validate
+        
+    Raises:
+        ValueError: If request_id is invalid
+    """
+    if not request_id:
+        raise ValueError("request_id cannot be empty")
+    
+    if not isinstance(request_id, str):
+        raise ValueError(f"request_id must be a string, got {type(request_id)}")
+    
+    if len(request_id) > 255:
+        raise ValueError(f"request_id too long (max 255 chars, got {len(request_id)})")
+    
+    if len(request_id) < 1:
+        raise ValueError("request_id must be at least 1 character")
+
+
+def validate_orchestrator_name(orchestrator_name: str) -> None:
+    """
+    Utility helper: Validate orchestrator name format.
+    
+    Args:
+        orchestrator_name: Orchestrator name to validate
+        
+    Raises:
+        ValueError: If orchestrator_name is invalid
+    """
+    if not orchestrator_name:
+        raise ValueError("orchestrator_name cannot be empty")
+    
+    if not isinstance(orchestrator_name, str):
+        raise ValueError(f"orchestrator_name must be a string, got {type(orchestrator_name)}")
+    
+    if len(orchestrator_name) > 100:
+        raise ValueError(f"orchestrator_name too long (max 100 chars, got {len(orchestrator_name)})")
+    
+    if not orchestrator_name.replace('_', '').isalnum():
+        raise ValueError("orchestrator_name must contain only alphanumeric characters and underscores")

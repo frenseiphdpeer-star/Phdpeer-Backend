@@ -54,14 +54,19 @@ class DocumentService:
         document_type: Optional[str] = None,
     ) -> UUID:
         """
-        Upload and process a document.
+        Upload and process a document (PDF/DOCX).
         
-        Steps:
-        1. Validate file type
-        2. Extract raw text
-        3. Save file to storage
-        4. Create DocumentArtifact record
-        5. Return document ID
+        Processing pipeline:
+        1. Validate file type (PDF/DOCX)
+        2. Extract raw text from document
+        3. Normalize text (remove headers, footers, noise)
+        4. Detect language
+        5. Generate section_map using headings + heuristics
+        6. Save file to storage
+        7. Persist: raw_text, normalized_text, section_map_json
+        8. Return document ID
+        
+        No intelligence logic - pure text processing and heuristics.
         
         Args:
             user_id: ID of the user uploading the document
@@ -93,17 +98,23 @@ class DocumentService:
         unique_filename, file_extension = generate_unique_filename(filename)
         file_size = get_file_size(file_content)
         
-        # Extract text from document
+        # Extract raw text from document (PDF/DOCX)
         try:
             raw_text = extract_text(file_content, file_extension)
         except TextExtractionError as e:
             raise DocumentServiceError(f"Text extraction failed: {str(e)}")
         
-        # Process text
+        # Normalize text (remove headers, footers, noise)
         normalized_text = TextProcessor.normalize_text(raw_text)
-        word_count = TextProcessor.count_words(normalized_text)
+        
+        # Detect language
         detected_language = TextProcessor.detect_language(normalized_text)
+        
+        # Generate section_map using headings + heuristics
         section_map = TextProcessor.generate_section_map(normalized_text)
+        
+        # Count words from normalized text
+        word_count = TextProcessor.count_words(normalized_text)
         
         # Save file to storage
         try:
@@ -112,6 +123,7 @@ class DocumentService:
             raise DocumentServiceError(f"File storage failed: {str(e)}")
         
         # Create DocumentArtifact record
+        # Persist: raw_text, normalized_text (as document_text), section_map_json
         document_artifact = DocumentArtifact(
             user_id=user_id,
             title=title or filename,
@@ -120,11 +132,12 @@ class DocumentService:
             file_path=file_path,
             file_size_bytes=file_size,
             document_type=document_type,
-            document_text=normalized_text,
+            raw_text=raw_text,  # Raw extracted text
+            document_text=normalized_text,  # Normalized text
             word_count=word_count,
             detected_language=detected_language,
-            section_map_json=section_map,
-            metadata={
+            section_map_json=section_map,  # Section map with headings + heuristics
+            document_metadata={
                 "original_filename": filename,
                 "processing_timestamp": str(self.db.execute("SELECT NOW()").scalar())
             }
@@ -173,7 +186,7 @@ class DocumentService:
     
     def get_extracted_text(self, document_id: UUID) -> Optional[str]:
         """
-        Get extracted text from a document.
+        Get normalized extracted text from a document.
         
         Args:
             document_id: Document ID
@@ -184,6 +197,21 @@ class DocumentService:
         document = self.get_document(document_id)
         if document:
             return document.document_text
+        return None
+    
+    def get_raw_text(self, document_id: UUID) -> Optional[str]:
+        """
+        Get raw extracted text from a document (before normalization).
+        
+        Args:
+            document_id: Document ID
+            
+        Returns:
+            Raw document text or None if document not found
+        """
+        document = self.get_document(document_id)
+        if document:
+            return document.raw_text
         return None
     
     def get_section_map(self, document_id: UUID) -> Optional[Dict[str, Any]]:

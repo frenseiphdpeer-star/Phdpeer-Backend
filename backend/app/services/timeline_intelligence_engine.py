@@ -365,17 +365,36 @@ class TimelineIntelligenceEngine:
         """
         Detect timeline stages using multiple detection methods.
         
+        Detects stages like:
+        - Literature Review
+        - Methodology
+        - Data Collection
+        - Analysis
+        - Writing
+        - Submission
+        
         Detection methods:
         1. Section headers - Matches section titles against known stage names
         2. Keyword clusters - Groups related keywords in text segments
-        3. Temporal phrases - Identifies time-based indicators
+        3. Temporal phrases - Identifies time-based indicators (e.g., "after collecting", "will analyze")
+        
+        Rules:
+        - No dates: Does not extract or parse dates
+        - No dependencies: Does not map dependencies between stages
+        - Returns ordered stages with confidence scores and evidence snippets
         
         Args:
             text: Plain text input
             section_map: Optional section map from TextProcessor (JSONB from document)
             
         Returns:
-            Ordered list of DetectedStage objects with confidence and evidence
+            Ordered list of DetectedStage objects with:
+            - stage_type: StageType enum
+            - title: Human-readable title
+            - description: Extracted description
+            - confidence: Confidence score (0.0 to 1.0)
+            - evidence: List of EvidenceSnippet objects with source and location
+            - order_hint: Suggested chronological order
         """
         segments = self.segment_text(text)
         detected_stages = []
@@ -501,18 +520,28 @@ class TimelineIntelligenceEngine:
         """
         Extract milestones for each detected stage.
         
-        Generates 2-5 milestone candidates per stage based on:
-        - Explicit mentions in text (deliverables, exams, reviews)
-        - Generic stage-appropriate milestones (if no explicit mentions)
+        For each detected stage:
+        - Generate 2-5 milestone candidates
+        - Each milestone includes name, description, evidence_snippet
+        - Milestones are generic and editable (no commitments)
         
-        All milestones are generic and editable - no hard commitments.
+        Rules:
+        - No dates: Does not extract or parse dates
+        - No dependencies: Does not map dependencies between milestones
+        - Generic templates: All milestones are suggestions, not commitments
         
         Args:
             text: Plain text input
             section_map: Optional section map from document
             
         Returns:
-            List of ExtractedMilestone objects (2-5 per stage)
+            List of ExtractedMilestone objects (2-5 per stage) with:
+            - name: Milestone name
+            - description: Milestone description
+            - evidence_snippet: Evidence text from document or generic template
+            - stage: Associated stage title
+            - milestone_type: Type (deliverable, exam, review, publication, etc.)
+            - confidence: Confidence score (0.0 to 1.0)
         """
         # First detect stages
         stages = self.detect_stages(text, section_map)
@@ -567,18 +596,52 @@ class TimelineIntelligenceEngine:
                                 confidence=0.7  # Higher confidence for explicit mentions
                             ))
             
-            # Method 2: Generate generic milestones if we don't have enough
-            if len(stage_milestones) < 2:
+            # Method 2: Generate generic milestones to ensure 2-5 per stage
+            # Target: 2-5 milestones per stage (minimum 2, maximum 5)
+            target_min = 2
+            target_max = 5
+            current_count = len(stage_milestones)
+            
+            # Calculate how many generic milestones we need
+            if current_count < target_min:
+                # Need at least 2 milestones - generate enough to reach 2
+                needed = target_min - current_count
+            elif current_count < target_max:
+                # Have 2-4 milestones - add 1-2 more to reach closer to 5
+                needed = min(target_max - current_count, 2)
+            else:
+                # Already have 5 or more - no need to add
+                needed = 0
+            
+            if needed > 0:
                 generic_milestones = self._generate_generic_milestones(
-                    stage, len(stage_milestones)
+                    stage, current_count, needed, text
                 )
                 stage_milestones.extend(generic_milestones)
             
+            # Final check: ensure we have at least 2 milestones
+            if len(stage_milestones) < target_min:
+                # Fallback: generate minimum 2 generic milestones
+                fallback_needed = target_min - len(stage_milestones)
+                fallback_milestones = self._generate_generic_milestones(
+                    stage, len(stage_milestones), fallback_needed, text
+                )
+                stage_milestones.extend(fallback_milestones)
+            
             # Limit to 5 milestones per stage
-            stage_milestones = stage_milestones[:5]
+            stage_milestones = stage_milestones[:target_max]
             
             # Deduplicate within stage
             stage_milestones = self._deduplicate_milestones(stage_milestones)
+            
+            # Ensure all milestones have evidence_snippet
+            for milestone in stage_milestones:
+                if not milestone.evidence_snippet or milestone.evidence_snippet.strip() == "":
+                    # Use stage description or generic evidence
+                    milestone.evidence_snippet = (
+                        stage.description[:150] if stage.description 
+                        else f"Milestone for {stage.title} stage"
+                    )
             
             all_milestones.extend(stage_milestones)
         
@@ -589,26 +652,35 @@ class TimelineIntelligenceEngine:
         text: str,
         stages: Optional[List[DetectedStage]] = None,
         milestones: Optional[List[ExtractedMilestone]] = None,
-        section_map: Optional[Dict] = None
+        section_map: Optional[Dict] = None,
+        discipline: Optional[str] = None
     ) -> List[DurationEstimate]:
         """
         Estimate duration ranges for stages and milestones.
         
-        Uses multiple methods:
-        1. Explicit mentions in text (e.g., "6 months", "2 years")
-        2. Pattern-based inference (e.g., "over the summer" = 3 months)
-        3. Heuristic defaults based on stage/milestone type
+        Uses discipline-aware heuristics to provide accurate duration estimates.
+        Returns duration ranges (min_weeks, max_weeks) - no absolute dates.
         
-        Returns duration ranges (min-max) in both weeks and months.
+        Methods:
+        1. Explicit mentions in text (e.g., "6 months", "2 years")
+        2. Discipline-aware heuristics (adjusts based on field of study)
+        3. Stage/milestone type defaults with ranges
+        
+        Rules:
+        - Discipline-aware: Different disciplines have different typical durations
+        - Returns ranges: (min_weeks, max_weeks) for flexibility
+        - No absolute dates: Only relative durations
+        - Pure deterministic: No ML, no randomness
         
         Args:
             text: Plain text input
             stages: Pre-detected stages (optional, will detect if not provided)
             milestones: Pre-extracted milestones (optional)
             section_map: Optional section map from document
+            discipline: Optional discipline/field of study (e.g., "Computer Science", "Biology")
             
         Returns:
-            List of DurationEstimate objects with ranges
+            List of DurationEstimate objects with ranges in weeks and months
         """
         segments = self.segment_text(text)
         estimates = []
@@ -678,9 +750,9 @@ class TimelineIntelligenceEngine:
                     source_text=explicit_match["source"]
                 ))
             else:
-                # Use heuristic defaults with ranges
-                min_months, max_months = self._get_default_duration_range(
-                    stage.stage_type
+                # Use discipline-aware heuristics with ranges
+                min_months, max_months = self._get_discipline_aware_duration_range(
+                    stage.stage_type, discipline
                 )
                 estimates.append(DurationEstimate(
                     item_description=stage.title,
@@ -690,12 +762,12 @@ class TimelineIntelligenceEngine:
                     duration_months_min=min_months,
                     duration_months_max=max_months,
                     confidence="medium",
-                    basis="heuristic"
+                    basis="heuristic" if not discipline else "discipline_heuristic"
                 ))
         
         # Method 3: Estimate milestone durations
         milestone_estimates = self._estimate_milestone_durations(
-            milestones, explicit_durations
+            milestones, explicit_durations, discipline
         )
         estimates.extend(milestone_estimates)
         
@@ -711,21 +783,34 @@ class TimelineIntelligenceEngine:
         """
         Map dependencies between stages and milestones.
         
-        Creates a dependency graph ensuring DAG (no cycles).
-        Uses multiple methods:
+        Builds a Directed Acyclic Graph (DAG) with:
+        - Logical ordering between stages enforced
+        - Cycle detection and removal
+        - Explicit validation of DAG property
+        
+        Methods:
         1. Explicit dependency signals in text ("after", "before", "requires")
-        2. Implicit sequential ordering of stages
+        2. Implicit sequential ordering of stages (enforced)
         3. Stage-milestone parent relationships
-        4. Critical path analysis
+        4. Critical blocking dependencies
+        
+        Rules:
+        - Build DAG: Directed Acyclic Graph structure
+        - Enforce logical ordering: Stages follow natural PhD progression
+        - Validate no cycles: All cycles are detected and removed
+        - Return dependency edges: List of Dependency objects
         
         Args:
             text: Plain text input
-            stages: Pre-detected stages (optional)
+            stages: Pre-detected stages (optional, will detect if not provided)
             milestones: Pre-extracted milestones (optional)
             section_map: Optional section map from document
             
         Returns:
-            List of Dependency objects (guaranteed to be DAG)
+            List of Dependency objects (guaranteed to be DAG, validated)
+            
+        Raises:
+            ValueError: If DAG validation fails after cycle removal
         """
         segments = self.segment_text(text)
         
@@ -735,6 +820,9 @@ class TimelineIntelligenceEngine:
         if milestones is None:
             milestones = self.extract_milestones(text, section_map)
         
+        # Sort stages by logical order to enforce ordering
+        stages = self._enforce_stage_ordering(stages)
+        
         dependencies = []
         
         # Method 1: Explicit dependency signals in text
@@ -743,7 +831,7 @@ class TimelineIntelligenceEngine:
         )
         dependencies.extend(explicit_deps)
         
-        # Method 2: Implicit sequential dependencies for stages
+        # Method 2: Implicit sequential dependencies for stages (enforced)
         stage_deps = self._create_stage_dependencies(stages)
         dependencies.extend(stage_deps)
         
@@ -755,8 +843,18 @@ class TimelineIntelligenceEngine:
         blocking_deps = self._create_blocking_dependencies(stages, milestones)
         dependencies.extend(blocking_deps)
         
-        # Validate DAG and remove cycles
+        # Remove duplicate dependencies (same dependent -> depends_on)
+        dependencies = self._deduplicate_dependencies(dependencies)
+        
+        # Build DAG: Remove cycles and ensure acyclic structure
         dependencies = self._ensure_dag(dependencies, stages, milestones)
+        
+        # Validate DAG: Explicit check that no cycles exist
+        if not self._validate_dag(dependencies, stages, milestones):
+            raise ValueError(
+                "Failed to create valid DAG: cycles detected after removal attempt. "
+                "This should not happen - please report this error."
+            )
         
         return dependencies
     
@@ -806,6 +904,56 @@ class TimelineIntelligenceEngine:
             StageType.OTHER: 10
         }
         return order.get(stage_type, 99)
+    
+    def _enforce_stage_ordering(self, stages: List[DetectedStage]) -> List[DetectedStage]:
+        """
+        Enforce logical ordering between stages.
+        
+        Sorts stages by their natural PhD progression order.
+        This ensures dependencies follow logical sequence.
+        
+        Args:
+            stages: List of detected stages
+            
+        Returns:
+            Sorted list of stages in logical order
+        """
+        # Sort by order hint (natural PhD progression)
+        sorted_stages = sorted(
+            stages,
+            key=lambda s: self._get_stage_order_hint(s.stage_type)
+        )
+        return sorted_stages
+    
+    def _deduplicate_dependencies(self, dependencies: List[Dependency]) -> List[Dependency]:
+        """
+        Remove duplicate dependencies.
+        
+        Keeps the dependency with highest confidence if duplicates exist.
+        
+        Args:
+            dependencies: List of dependencies
+            
+        Returns:
+            Deduplicated list of dependencies
+        """
+        seen = {}  # (dependent_item, depends_on_item) -> Dependency
+        
+        for dep in dependencies:
+            key = (dep.dependent_item, dep.depends_on_item)
+            
+            # Skip self-dependencies (would create cycles)
+            if dep.dependent_item == dep.depends_on_item:
+                continue
+            
+            if key not in seen:
+                seen[key] = dep
+            else:
+                # Keep the one with higher confidence
+                if dep.confidence > seen[key].confidence:
+                    seen[key] = dep
+        
+        return list(seen.values())
     
     def _extract_stage_description(
         self,
@@ -915,19 +1063,24 @@ class TimelineIntelligenceEngine:
     def _generate_generic_milestones(
         self, 
         stage: DetectedStage, 
-        existing_count: int
+        existing_count: int,
+        needed: int = None,
+        text: str = ""
     ) -> List[ExtractedMilestone]:
         """
         Generate generic milestones for a stage.
         
         These are editable templates that users can customize.
+        No commitments - all milestones are suggestions.
         
         Args:
             stage: The detected stage
             existing_count: Number of explicit milestones already found
+            needed: Number of milestones to generate (default: 2 - existing_count)
+            text: Optional text to extract evidence snippets from
             
         Returns:
-            List of generic milestone templates
+            List of generic milestone templates (2-5 per stage)
         """
         # Generic milestone templates by stage type
         templates = {
@@ -1170,11 +1323,38 @@ class TimelineIntelligenceEngine:
             ]
         
         # Calculate how many generic milestones to add
-        needed = max(2 - existing_count, 0)  # At least 2 total
-        needed = min(needed, 5 - existing_count)  # Max 5 total
+        if needed is None:
+            # Ensure at least 2 milestones total, up to 5 total
+            needed = max(2 - existing_count, 0)  # At least 2 total
+            needed = min(needed, 5 - existing_count)  # Max 5 total
         
-        # Select templates
-        selected_templates = stage_templates[:needed]
+        # Ensure we generate at least 2 if no explicit milestones found
+        if existing_count == 0:
+            needed = max(needed, 2)
+        
+        # Cap at maximum allowed (5 total)
+        needed = min(needed, 5 - existing_count)
+        
+        # Ensure we don't generate negative or zero milestones
+        needed = max(needed, 0)
+        
+        # Select templates (prioritize critical milestones first)
+        available_templates = sorted(
+            stage_templates, 
+            key=lambda x: (not x["critical"], x["name"])
+        )
+        selected_templates = available_templates[:needed]
+        
+        # Extract evidence snippet from stage evidence if available
+        evidence_snippet = ""
+        if stage.evidence:
+            # Use first evidence snippet as context
+            first_evidence = stage.evidence[0]
+            evidence_snippet = first_evidence.text[:150]
+        elif stage.description:
+            evidence_snippet = stage.description[:150]
+        else:
+            evidence_snippet = f"Generic milestone template for {stage.title} stage"
         
         # Convert to ExtractedMilestone objects
         milestones = []
@@ -1184,7 +1364,7 @@ class TimelineIntelligenceEngine:
                 description=template["description"],
                 stage=stage.title,
                 milestone_type=template["type"],
-                evidence_snippet=f"Generic milestone for {stage.title} stage",
+                evidence_snippet=evidence_snippet,  # Use stage evidence or description
                 keywords=[],
                 source_segment=None,
                 is_critical=template["critical"],
@@ -1341,12 +1521,113 @@ class TimelineIntelligenceEngine:
         }
         return defaults.get(stage_type, (3, 6))
     
+    def _get_discipline_aware_duration_range(
+        self, 
+        stage_type: StageType, 
+        discipline: Optional[str] = None
+    ) -> tuple:
+        """
+        Get discipline-aware duration range for a stage type.
+        
+        Different disciplines have different typical durations:
+        - Experimental sciences (Biology, Chemistry): Longer data collection
+        - Theoretical sciences (Math, CS): Longer analysis/writing
+        - Social sciences: Longer data collection and analysis
+        - Humanities: Longer writing phase
+        
+        Args:
+            stage_type: Type of stage
+            discipline: Optional discipline/field of study
+            
+        Returns:
+            Tuple of (min_months, max_months)
+        """
+        # Base defaults
+        base_min, base_max = self._get_default_duration_range(stage_type)
+        
+        if not discipline:
+            return (base_min, base_max)
+        
+        discipline_lower = discipline.lower()
+        
+        # Discipline categories
+        experimental_sciences = ["biology", "chemistry", "physics", "engineering", "biomedical"]
+        theoretical_sciences = ["mathematics", "computer science", "cs", "statistics", "theoretical"]
+        social_sciences = ["psychology", "sociology", "anthropology", "economics", "political science"]
+        humanities = ["history", "literature", "philosophy", "languages", "arts"]
+        
+        # Adjustments by discipline category and stage type
+        adjustments = {
+            # Experimental sciences: Longer data collection, shorter writing
+            "experimental": {
+                StageType.DATA_COLLECTION: (1.5, 1.8),  # 50-80% longer
+                StageType.ANALYSIS: (1.2, 1.5),         # 20-50% longer
+                StageType.WRITING: (0.8, 1.0),          # 0-20% shorter
+            },
+            # Theoretical sciences: Shorter data collection, longer analysis/writing
+            "theoretical": {
+                StageType.DATA_COLLECTION: (0.5, 0.8),  # 20-50% shorter
+                StageType.ANALYSIS: (1.3, 1.8),          # 30-80% longer
+                StageType.WRITING: (1.2, 1.5),           # 20-50% longer
+                StageType.METHODOLOGY: (1.2, 1.5),       # 20-50% longer
+            },
+            # Social sciences: Longer data collection and analysis
+            "social": {
+                StageType.DATA_COLLECTION: (1.3, 1.8),  # 30-80% longer
+                StageType.ANALYSIS: (1.2, 1.6),          # 20-60% longer
+                StageType.WRITING: (1.1, 1.3),           # 10-30% longer
+            },
+            # Humanities: Longer literature review and writing
+            "humanities": {
+                StageType.LITERATURE_REVIEW: (1.5, 2.0),  # 50-100% longer
+                StageType.WRITING: (1.5, 2.0),             # 50-100% longer
+                StageType.DATA_COLLECTION: (0.7, 1.0),    # 0-30% shorter
+            }
+        }
+        
+        # Determine discipline category
+        category = None
+        if any(d in discipline_lower for d in experimental_sciences):
+            category = "experimental"
+        elif any(d in discipline_lower for d in theoretical_sciences):
+            category = "theoretical"
+        elif any(d in discipline_lower for d in social_sciences):
+            category = "social"
+        elif any(d in discipline_lower for d in humanities):
+            category = "humanities"
+        
+        # Apply adjustments if category found and stage has adjustment
+        if category and category in adjustments:
+            stage_adjustments = adjustments[category]
+            if stage_type in stage_adjustments:
+                mult_min, mult_max = stage_adjustments[stage_type]
+                adjusted_min = int(base_min * mult_min)
+                adjusted_max = int(base_max * mult_max)
+                return (adjusted_min, adjusted_max)
+        
+        # No adjustment found, return base
+        return (base_min, base_max)
+    
     def _estimate_milestone_durations(
         self,
         milestones: List[ExtractedMilestone],
-        explicit_durations: Dict
+        explicit_durations: Dict,
+        discipline: Optional[str] = None
     ) -> List[DurationEstimate]:
-        """Estimate durations for milestones."""
+        """
+        Estimate durations for milestones.
+        
+        Uses discipline-aware heuristics when discipline is provided.
+        Returns duration ranges in weeks (min_weeks, max_weeks).
+        
+        Args:
+            milestones: List of milestones to estimate
+            explicit_durations: Dictionary of explicit duration mentions
+            discipline: Optional discipline/field of study
+            
+        Returns:
+            List of DurationEstimate objects with ranges
+        """
         estimates = []
         
         # Default milestone durations by type (weeks: min, max)
@@ -1557,17 +1838,23 @@ class TimelineIntelligenceEngine:
         milestones: List[ExtractedMilestone]
     ) -> List[Dependency]:
         """
-        Ensure dependency graph is a DAG (no cycles).
+        Build Directed Acyclic Graph (DAG) by removing cycles.
         
         Detects and removes cycles by priority:
         1. Keep higher confidence dependencies
         2. Keep blocking dependencies
         3. Keep sequential dependencies over prerequisite
         
+        Algorithm:
+        - Sort dependencies by priority (blocks > sequential > others, then by confidence)
+        - Incrementally add dependencies to graph
+        - Before adding each edge, check if it would create a cycle
+        - Only add edges that maintain DAG property
+        
         Returns:
-            List of dependencies guaranteed to be acyclic
+            List of dependencies guaranteed to be acyclic (valid DAG)
         """
-        # Build adjacency list
+        # Initialize graph with all nodes (stages and milestones)
         graph = {}
         all_items = (
             [s.title for s in stages] + 
@@ -1577,56 +1864,65 @@ class TimelineIntelligenceEngine:
         for item in all_items:
             graph[item] = []
         
-        # Add edges
-        dep_map = {}  # Map (from, to) -> Dependency
-        for dep in dependencies:
-            if dep.dependent_item in graph and dep.depends_on_item in graph:
-                graph[dep.dependent_item].append(dep.depends_on_item)
-                dep_map[(dep.dependent_item, dep.depends_on_item)] = dep
-        
-        # Detect cycles using DFS
-        def has_cycle(node, visited, rec_stack):
-            visited[node] = True
-            rec_stack[node] = True
+        # Cycle detection using DFS
+        def would_create_cycle(from_node: str, to_node: str, current_graph: dict) -> bool:
+            """
+            Check if adding edge (from_node -> to_node) would create a cycle.
             
-            for neighbor in graph[node]:
-                if not visited.get(neighbor, False):
-                    if has_cycle(neighbor, visited, rec_stack):
-                        return True
-                elif rec_stack.get(neighbor, False):
-                    return True
+            Uses DFS to detect if there's a path from to_node back to from_node.
+            If such a path exists, adding the edge would create a cycle.
+            """
+            if from_node not in current_graph or to_node not in current_graph:
+                return False
             
-            rec_stack[node] = False
+            # Check if there's a path from to_node to from_node
+            visited = set()
+            stack = [to_node]
+            
+            while stack:
+                node = stack.pop()
+                if node == from_node:
+                    return True  # Cycle detected
+                
+                if node in visited:
+                    continue
+                visited.add(node)
+                
+                # Add all neighbors to stack
+                for neighbor in current_graph.get(node, []):
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+            
             return False
         
-        # Find and remove cycles
-        filtered_deps = []
-        for dep in sorted(dependencies, key=lambda d: (
+        # Sort dependencies by priority:
+        # 1. Blocking dependencies (highest priority)
+        # 2. Sequential dependencies
+        # 3. Other dependencies
+        # Within each group, sort by confidence (descending)
+        sorted_deps = sorted(dependencies, key=lambda d: (
             0 if d.dependency_type == "blocks" else
             1 if d.dependency_type == "sequential" else 2,
             -d.confidence
-        )):
-            # Try adding this dependency
-            test_graph = {k: list(v) for k, v in graph.items()}
-            if dep.dependent_item in test_graph and dep.depends_on_item in test_graph:
-                test_graph[dep.dependent_item].append(dep.depends_on_item)
-                
-                # Check for cycles
-                visited = {}
-                rec_stack = {}
-                has_cycle_flag = False
-                
-                for node in test_graph:
-                    if not visited.get(node, False):
-                        if has_cycle(node, visited, rec_stack):
-                            has_cycle_flag = True
-                            break
-                
-                if not has_cycle_flag:
-                    # No cycle, keep this dependency
-                    filtered_deps.append(dep)
-                    if dep.dependent_item in graph and dep.depends_on_item in graph:
-                        graph[dep.dependent_item].append(dep.depends_on_item)
+        ))
+        
+        # Build DAG incrementally
+        filtered_deps = []
+        for dep in sorted_deps:
+            # Skip if nodes don't exist in graph
+            if dep.dependent_item not in graph or dep.depends_on_item not in graph:
+                continue
+            
+            # Skip self-dependencies (would create cycles)
+            if dep.dependent_item == dep.depends_on_item:
+                continue
+            
+            # Check if adding this edge would create a cycle
+            if not would_create_cycle(dep.dependent_item, dep.depends_on_item, graph):
+                # Safe to add - no cycle created
+                graph[dep.dependent_item].append(dep.depends_on_item)
+                filtered_deps.append(dep)
+            # Otherwise, skip this dependency (would create cycle)
         
         return filtered_deps
     
@@ -1637,48 +1933,75 @@ class TimelineIntelligenceEngine:
         milestones: List[ExtractedMilestone]
     ) -> bool:
         """
-        Validate that dependencies form a DAG.
+        Validate that dependencies form a Directed Acyclic Graph (DAG).
         
+        Uses DFS with recursion stack to detect cycles.
+        A valid DAG has no cycles - no path from a node back to itself.
+        
+        Args:
+            dependencies: List of dependency edges to validate
+            stages: List of stages (nodes in graph)
+            milestones: List of milestones (nodes in graph)
+            
         Returns:
-            True if DAG is valid, False otherwise
+            True if DAG is valid (no cycles), False otherwise
         """
-        # Build adjacency list
+        # Build adjacency list representation of the graph
         graph = {}
         all_items = (
             [s.title for s in stages] + 
             [m.name for m in milestones]
         )
         
+        # Initialize all nodes
         for item in all_items:
             graph[item] = []
         
-        # Add edges
+        # Add edges from dependencies
         for dep in dependencies:
-            if dep.dependent_item in graph and dep.depends_on_item in graph:
-                graph[dep.dependent_item].append(dep.depends_on_item)
+            # Skip invalid dependencies (nodes not in graph)
+            if dep.dependent_item not in graph or dep.depends_on_item not in graph:
+                continue
+            
+            # Skip self-dependencies (would create cycles)
+            if dep.dependent_item == dep.depends_on_item:
+                return False  # Self-dependency is a cycle
+            
+            # Add edge: dependent_item -> depends_on_item
+            graph[dep.dependent_item].append(dep.depends_on_item)
         
-        # Detect cycles using DFS
-        def has_cycle(node, visited, rec_stack):
+        # Detect cycles using DFS with recursion stack
+        def has_cycle(node: str, visited: dict, rec_stack: dict) -> bool:
+            """
+            Check if there's a cycle reachable from this node.
+            
+            Uses DFS with recursion stack to detect back edges.
+            A back edge (edge to a node in recursion stack) indicates a cycle.
+            """
             visited[node] = True
             rec_stack[node] = True
             
-            for neighbor in graph[node]:
-                if not visited.get(neighbor, False):
+            # Check all neighbors
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited or not visited[neighbor]:
+                    # Recurse into unvisited neighbor
                     if has_cycle(neighbor, visited, rec_stack):
                         return True
                 elif rec_stack.get(neighbor, False):
+                    # Back edge detected - cycle found
                     return True
             
+            # Remove from recursion stack (backtrack)
             rec_stack[node] = False
             return False
         
-        # Check all nodes
+        # Check all nodes for cycles
         visited = {}
         rec_stack = {}
         
         for node in graph:
-            if not visited.get(node, False):
+            if node not in visited or not visited[node]:
                 if has_cycle(node, visited, rec_stack):
-                    return False
+                    return False  # Cycle detected
         
-        return True
+        return True  # No cycles found - valid DAG

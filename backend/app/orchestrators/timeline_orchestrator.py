@@ -19,6 +19,7 @@ from app.services.timeline_intelligence_engine import (
     DetectedStage,
     ExtractedMilestone,
     DurationEstimate,
+    Dependency,
     StructuredTimeline,
 )
 from app.utils.invariants import check_committed_timeline_has_draft
@@ -79,7 +80,19 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         """
         Execute the timeline generation pipeline.
         
-        This is called by BaseOrchestrator's idempotent_transaction.
+        This is called by BaseOrchestrator's execute() method.
+        DecisionTrace is automatically written by BaseOrchestrator.
+        
+        Steps:
+        1. Validate baseline exists
+        2. Load baseline document text
+        3. Call detect_stages()
+        4. Call extract_milestones()
+        5. Call estimate_durations()
+        6. Call map_dependencies()
+        7. Assemble DraftTimeline
+        8. Persist DraftTimeline + children
+        9. Write DecisionTrace (automatic via BaseOrchestrator)
         
         Args:
             context: Pipeline context with baseline_id, user_id, etc.
@@ -125,7 +138,7 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 confidence=1.0
             )
         
-        # Step 2: Load DocumentArtifact text
+        # Step 2: Load baseline document text
         with self._trace_step("load_document_text") as step:
             if not baseline.document_artifact_id:
                 raise TimelineOrchestratorError(
@@ -170,86 +183,297 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 confidence=1.0
             )
         
-        # Step 3: Call TimelineIntelligenceEngine
-        with self._trace_step("generate_structured_timeline") as step:
-            structured_timeline = self.intelligence_engine.create_structured_timeline(
+        # Step 3: Call detect_stages()
+        with self._trace_step("detect_stages") as step:
+            detected_stages = self.intelligence_engine.detect_stages(
                 text=document_text,
-                section_map=section_map,
-                title=title or f"Timeline: {baseline.program_name}",
-                description=description or f"PhD timeline for {baseline.program_name}"
+                section_map=section_map
             )
             
             step.details = {
-                "stages_detected": len(structured_timeline.stages),
-                "milestones_extracted": len(structured_timeline.milestones),
-                "total_duration_min": structured_timeline.total_duration_months_min,
-                "total_duration_max": structured_timeline.total_duration_months_max,
-                "is_dag_valid": structured_timeline.is_dag_valid
+                "stages_detected": len(detected_stages),
+                "stage_titles": [s.title for s in detected_stages]
             }
             
             # Add evidence
             self.add_evidence(
-                evidence_type="timeline_analysis",
+                evidence_type="detected_stages",
                 data={
-                    "stages": [s.title for s in structured_timeline.stages],
-                    "milestone_count": len(structured_timeline.milestones),
-                    "duration_range": f"{structured_timeline.total_duration_months_min}-{structured_timeline.total_duration_months_max} months"
+                    "stages": [s.title for s in detected_stages],
+                    "stage_types": [s.stage_type.value for s in detected_stages]
                 },
-                source="TimelineIntelligenceEngine",
+                source="TimelineIntelligenceEngine.detect_stages()",
                 confidence=0.9
             )
         
-        # Step 4: Create DraftTimeline + stages + milestones
-        with self._trace_step("create_draft_timeline_record") as step:
+        # Step 4: Call extract_milestones()
+        with self._trace_step("extract_milestones") as step:
+            extracted_milestones = self.intelligence_engine.extract_milestones(
+                text=document_text,
+                section_map=section_map
+            )
+            
+            step.details = {
+                "milestones_extracted": len(extracted_milestones),
+                "critical_milestones": len([m for m in extracted_milestones if m.is_critical])
+            }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="extracted_milestones",
+                data={
+                    "total_milestones": len(extracted_milestones),
+                    "milestone_names": [m.name for m in extracted_milestones[:10]]
+                },
+                source="TimelineIntelligenceEngine.extract_milestones()",
+                confidence=0.8
+            )
+        
+        # Step 5: Call estimate_durations()
+        with self._trace_step("estimate_durations") as step:
+            # Extract discipline from baseline if available
+            discipline = getattr(baseline, 'field_of_study', None)
+            
+            duration_estimates = self.intelligence_engine.estimate_durations(
+                text=document_text,
+                stages=detected_stages,
+                milestones=extracted_milestones,
+                section_map=section_map,
+                discipline=discipline
+            )
+            
+            step.details = {
+                "duration_estimates": len(duration_estimates),
+                "stage_estimates": len([d for d in duration_estimates if d.item_type == "stage"]),
+                "milestone_estimates": len([d for d in duration_estimates if d.item_type == "milestone"])
+            }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="duration_estimates",
+                data={
+                    "total_estimates": len(duration_estimates),
+                    "discipline": discipline
+                },
+                source="TimelineIntelligenceEngine.estimate_durations()",
+                confidence=0.7
+            )
+        
+        # Step 6: Call map_dependencies()
+        with self._trace_step("map_dependencies") as step:
+            dependencies = self.intelligence_engine.map_dependencies(
+                text=document_text,
+                stages=detected_stages,
+                milestones=extracted_milestones,
+                section_map=section_map
+            )
+            
+            step.details = {
+                "dependencies_mapped": len(dependencies),
+                "dependency_types": list(set(d.dependency_type for d in dependencies))
+            }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="dependencies",
+                data={
+                    "total_dependencies": len(dependencies),
+                    "dependency_types": list(set(d.dependency_type for d in dependencies))
+                },
+                source="TimelineIntelligenceEngine.map_dependencies()",
+                confidence=0.8
+            )
+        
+        # Step 7: Assemble DraftTimeline
+        with self._trace_step("assemble_draft_timeline") as step:
+            # Generate default title if not provided
+            if not title:
+                title = f"Draft Timeline: {baseline.program_name}"
+            
+            # Generate default description if not provided
+            if not description:
+                description = (
+                    f"Draft timeline for {baseline.program_name} at {baseline.institution}. "
+                    f"Generated from baseline requirements and program structure."
+                )
+            
             draft_timeline = DraftTimeline(
                 user_id=user_id,
                 baseline_id=baseline_id,
-                title=structured_timeline.title,
-                description=structured_timeline.description,
+                title=title,
+                description=description,
                 version_number=version_number,
                 is_active=True,
-                notes=f"Status: {self.STATUS_DRAFT}"
+                notes=f"Status: {self.STATUS_DRAFT}"  # Status must be DRAFT
             )
             
+            step.details = {
+                "title": draft_timeline.title,
+                "status": self.STATUS_DRAFT
+            }
+        
+        # Step 8: Persist DraftTimeline + children
+        with self._trace_step("persist_draft_timeline") as step:
             self.db.add(draft_timeline)
-            self.db.flush()
+            self.db.flush()  # Get ID without committing
+            
+            # Create stage records
+            stage_records = self._create_stage_records(
+                draft_timeline_id=draft_timeline.id,
+                detected_stages=detected_stages,
+                duration_estimates=duration_estimates
+            )
+            
+            # Create milestone records
+            milestone_records = self._create_milestone_records(
+                stage_records=stage_records,
+                extracted_milestones=extracted_milestones,
+                detected_stages=detected_stages
+            )
+            
+            # Commit all changes
+            self.db.commit()
+            self.db.refresh(draft_timeline)
             
             step.details = {
                 "draft_timeline_id": str(draft_timeline.id),
-                "title": draft_timeline.title
-            }
-        
-        # Step 5: Create stages and milestones
-        with self._trace_step("create_stages_and_milestones") as step:
-            stage_records = self._create_stages_from_structured(
-                draft_timeline_id=draft_timeline.id,
-                structured_timeline=structured_timeline
-            )
-            
-            milestone_records = self._create_milestones_from_structured(
-                stage_records=stage_records,
-                structured_timeline=structured_timeline
-            )
-            
-            step.details = {
                 "stages_created": len(stage_records),
                 "milestones_created": len(milestone_records)
             }
         
-        # Step 6: Commit transaction
-        with self._trace_step("commit_transaction"):
-            self.db.commit()
-            self.db.refresh(draft_timeline)
+        # Step 9: Write DecisionTrace (automatic via BaseOrchestrator.execute())
+        # The BaseOrchestrator.execute() method automatically writes DecisionTrace
+        # after _execute_pipeline completes successfully
         
-        # Step 7: Build UI-ready response
-        response = self._build_ui_response(
+        # Build UI-ready response
+        response = self._build_ui_response_from_components(
             draft_timeline=draft_timeline,
             stage_records=stage_records,
             milestone_records=milestone_records,
-            structured_timeline=structured_timeline
+            detected_stages=detected_stages,
+            extracted_milestones=extracted_milestones,
+            duration_estimates=duration_estimates,
+            dependencies=dependencies
         )
         
         return response
+    
+    def _build_ui_response_from_components(
+        self,
+        draft_timeline: DraftTimeline,
+        stage_records: List[TimelineStage],
+        milestone_records: List[TimelineMilestone],
+        detected_stages: List[DetectedStage],
+        extracted_milestones: List[ExtractedMilestone],
+        duration_estimates: List[DurationEstimate],
+        dependencies: List[Dependency]
+    ) -> Dict[str, Any]:
+        """
+        Build UI-ready JSON response from individual components.
+        
+        Args:
+            draft_timeline: Created draft timeline
+            stage_records: Created stage records
+            milestone_records: Created milestone records
+            detected_stages: Detected stages from intelligence engine
+            extracted_milestones: Extracted milestones from intelligence engine
+            duration_estimates: Duration estimates from intelligence engine
+            dependencies: Dependencies from intelligence engine
+            
+        Returns:
+            UI-ready JSON dictionary
+        """
+        # Group milestones by stage
+        milestones_by_stage = {}
+        for milestone in milestone_records:
+            stage_id = milestone.timeline_stage_id
+            if stage_id not in milestones_by_stage:
+                milestones_by_stage[stage_id] = []
+            milestones_by_stage[stage_id].append(milestone)
+        
+        # Build stages array with milestones
+        stages_array = []
+        for stage in stage_records:
+            stage_milestones = milestones_by_stage.get(stage.id, [])
+            
+            stages_array.append({
+                "id": str(stage.id),
+                "title": stage.title,
+                "description": stage.description,
+                "stage_order": stage.stage_order,
+                "duration_months": stage.duration_months,
+                "status": stage.status,
+                "milestones": [
+                    {
+                        "id": str(m.id),
+                        "title": m.title,
+                        "description": m.description,
+                        "milestone_order": m.milestone_order,
+                        "is_critical": m.is_critical,
+                        "is_completed": m.is_completed,
+                        "deliverable_type": m.deliverable_type
+                    }
+                    for m in stage_milestones
+                ]
+            })
+        
+        # Build dependencies array
+        dependencies_array = [
+            {
+                "dependent_item": dep.dependent_item,
+                "depends_on_item": dep.depends_on_item,
+                "dependency_type": dep.dependency_type,
+                "confidence": dep.confidence,
+                "reason": dep.reason
+            }
+            for dep in dependencies
+        ]
+        
+        # Build duration estimates array
+        durations_array = [
+            {
+                "item_description": dur.item_description,
+                "item_type": dur.item_type,
+                "duration_weeks_min": dur.duration_weeks_min,
+                "duration_weeks_max": dur.duration_weeks_max,
+                "duration_months_min": dur.duration_months_min,
+                "duration_months_max": dur.duration_months_max,
+                "confidence": dur.confidence,
+                "basis": dur.basis
+            }
+            for dur in duration_estimates
+        ]
+        
+        # Calculate total duration from estimates
+        stage_durations = [d for d in duration_estimates if d.item_type == "stage"]
+        total_duration_months_min = sum(d.duration_months_min for d in stage_durations) if stage_durations else 0
+        total_duration_months_max = sum(d.duration_months_max for d in stage_durations) if stage_durations else 0
+        
+        # Build complete response
+        return {
+            "timeline": {
+                "id": str(draft_timeline.id),
+                "baseline_id": str(draft_timeline.baseline_id),
+                "user_id": str(draft_timeline.user_id),
+                "title": draft_timeline.title,
+                "description": draft_timeline.description,
+                "version_number": draft_timeline.version_number,
+                "is_active": draft_timeline.is_active,
+                "status": self.STATUS_DRAFT,  # Status must be DRAFT
+                "created_at": draft_timeline.created_at.isoformat() if draft_timeline.created_at else None
+            },
+            "stages": stages_array,
+            "dependencies": dependencies_array,
+            "durations": durations_array,
+            "metadata": {
+                "total_stages": len(stage_records),
+                "total_milestones": len(milestone_records),
+                "total_duration_months_min": total_duration_months_min,
+                "total_duration_months_max": total_duration_months_max,
+                "is_dag_valid": len(dependencies) > 0,  # DAG validation done in map_dependencies
+                "generated_at": datetime.utcnow().isoformat()
+            }
+        }
     
     def generate(
         self,
@@ -271,11 +495,16 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         
         Steps:
         1. Validate baseline exists
-        2. Load DocumentArtifact text
-        3. Call TimelineIntelligenceEngine
-        4. Create DraftTimeline + stages + milestones
-        5. Store everything with status=DRAFT
-        6. Write DecisionTrace
+        2. Load baseline document text
+        3. Call detect_stages()
+        4. Call extract_milestones()
+        5. Call estimate_durations()
+        6. Call map_dependencies()
+        7. Assemble DraftTimeline
+        8. Persist DraftTimeline + children
+        9. Write DecisionTrace (automatic via BaseOrchestrator)
+        
+        Status must be DRAFT.
         
         Args:
             request_id: Idempotency key (use UUID for new requests)
@@ -291,15 +520,15 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         Raises:
             TimelineOrchestratorError: If validation fails or processing errors occur
         """
-        return self.idempotent_transaction(
-            method=self._execute_pipeline,
+        return self.execute(
             request_id=request_id,
-            user_id=user_id,
-            baseline_id=str(baseline_id),
-            user_id_str=str(user_id),
-            title=title,
-            description=description,
-            version_number=version_number
+            input_data={
+                "baseline_id": str(baseline_id),
+                "user_id": str(user_id),
+                "title": title,
+                "description": description,
+                "version_number": version_number
+            }
         )
     
     def create_draft_timeline(
@@ -568,11 +797,20 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         """
         Commit a draft timeline to create an immutable committed timeline.
         
-        Enhanced version with:
+        Rules:
+        - DraftTimeline must exist and belong to user
+        - Validate completeness (stages, milestones required)
+        - Create CommittedTimeline (immutable copy)
+        - Freeze content (mark draft as inactive)
+        - Increment version (automatic version bump)
+        - Prevent re-commit (idempotency + explicit check)
+        
+        Committed timelines must be immutable.
+        
+        Enhanced with:
         - Idempotency (duplicate commits return cached response)
         - Decision tracing (full audit trail)
         - Edit history preservation
-        - Version increment
         - Immutability enforcement
         
         Args:
@@ -584,6 +822,10 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
             
         Returns:
             UI-ready JSON with committed timeline details
+            
+        Raises:
+            TimelineOrchestratorError: If validation fails
+            TimelineAlreadyCommittedError: If already committed
         """
         return self.execute(
             request_id=request_id,
@@ -599,26 +841,32 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         """
         Execute the timeline commit pipeline.
         
+        Steps:
+        1. Validate DraftTimeline exists and belongs to user
+        2. Validate completeness (stages, milestones required)
+        3. Prevent re-commit (check if already committed)
+        4. Increment version
+        5. Create CommittedTimeline (immutable)
+        6. Copy stages and milestones to committed timeline
+        7. Freeze content (mark draft as inactive)
+        8. Persist all changes
+        9. Write DecisionTrace (automatic via BaseOrchestrator)
+        
+        Committed timelines are immutable after creation.
+        
         Args:
-            context: Pipeline context
+            context: Pipeline context with draft_timeline_id, user_id, etc.
             
         Returns:
             UI-ready JSON response
         """
         draft_timeline_id = UUID(context['draft_timeline_id'])
-        user_id = UUID(context['user_id_str'])
+        user_id = UUID(context['user_id'])
         title = context.get('title')
         description = context.get('description')
         
-        # Invariant check: No committed timeline without draft
-        check_committed_timeline_has_draft(
-            db=self.db,
-            draft_timeline_id=draft_timeline_id,
-            user_id=user_id
-        )
-        
-        # Step 1: Validate draft timeline
-        with self._trace_step("validate_draft_timeline") as step:
+        # Step 1: Validate DraftTimeline must exist
+        with self._trace_step("validate_draft_timeline_exists") as step:
             draft_timeline = self.db.query(DraftTimeline).filter(
                 DraftTimeline.id == draft_timeline_id
             ).first()
@@ -628,15 +876,17 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                     f"Draft timeline {draft_timeline_id} not found"
                 )
             
+            # Validate ownership
             if draft_timeline.user_id != user_id:
                 raise TimelineOrchestratorError(
-                    f"Draft timeline does not belong to user {user_id}"
+                    f"Draft timeline {draft_timeline_id} does not belong to user {user_id}"
                 )
             
             step.details = {
                 "draft_timeline_id": str(draft_timeline_id),
                 "title": draft_timeline.title,
-                "version": draft_timeline.version_number
+                "version": draft_timeline.version_number,
+                "is_active": draft_timeline.is_active
             }
             
             # Add evidence
@@ -645,61 +895,102 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 data={
                     "id": str(draft_timeline.id),
                     "title": draft_timeline.title,
-                    "baseline_id": str(draft_timeline.baseline_id)
+                    "baseline_id": str(draft_timeline.baseline_id),
+                    "is_active": draft_timeline.is_active
                 },
                 source=f"DraftTimeline:{draft_timeline_id}",
                 confidence=1.0
             )
         
-        # Step 2: Check if already committed
-        with self._trace_step("check_commit_status") as step:
-            existing_commit = self.db.query(CommittedTimeline).filter(
-                CommittedTimeline.draft_timeline_id == draft_timeline_id
-            ).first()
-            
-            if existing_commit:
-                raise TimelineAlreadyCommittedError(
-                    f"Draft timeline already committed (committed ID: {existing_commit.id})"
-                )
-            
-            step.details = {"already_committed": False}
-        
-        # Step 3: Get stages and milestones
-        with self._trace_step("load_draft_content") as step:
+        # Step 2: Validate completeness
+        with self._trace_step("validate_completeness") as step:
             draft_stages = self.db.query(TimelineStage).filter(
                 TimelineStage.draft_timeline_id == draft_timeline_id
             ).order_by(TimelineStage.stage_order).all()
             
             if not draft_stages:
                 raise TimelineOrchestratorError(
-                    "Draft timeline has no stages. Cannot commit empty timeline."
+                    "Draft timeline has no stages. Cannot commit incomplete timeline."
                 )
             
-            # Get total milestones
+            # Validate each stage has required fields
+            incomplete_stages = []
+            for stage in draft_stages:
+                if not stage.title or not stage.title.strip():
+                    incomplete_stages.append(f"Stage {stage.stage_order}: missing title")
+                if stage.duration_months is None or stage.duration_months <= 0:
+                    incomplete_stages.append(f"Stage {stage.stage_order}: invalid duration")
+            
+            if incomplete_stages:
+                raise TimelineOrchestratorError(
+                    f"Draft timeline is incomplete: {', '.join(incomplete_stages)}"
+                )
+            
+            # Get milestones for completeness check
             total_milestones = 0
+            milestones_by_stage = {}
             for stage in draft_stages:
                 milestones = self.db.query(TimelineMilestone).filter(
                     TimelineMilestone.timeline_stage_id == stage.id
-                ).count()
-                total_milestones += milestones
+                ).order_by(TimelineMilestone.milestone_order).all()
+                milestones_by_stage[stage.id] = milestones
+                total_milestones += len(milestones)
             
             step.details = {
                 "total_stages": len(draft_stages),
-                "total_milestones": total_milestones
+                "total_milestones": total_milestones,
+                "is_complete": True
             }
             
             # Add evidence
             self.add_evidence(
-                evidence_type="draft_content",
+                evidence_type="completeness_validation",
                 data={
                     "stages": [s.title for s in draft_stages],
-                    "total_milestones": total_milestones
+                    "total_milestones": total_milestones,
+                    "stage_count": len(draft_stages)
                 },
                 source=f"DraftTimeline:{draft_timeline_id}",
                 confidence=1.0
             )
         
-        # Step 4: Get edit history
+        # Step 3: Prevent re-commit
+        with self._trace_step("prevent_recommit") as step:
+            existing_commit = self.db.query(CommittedTimeline).filter(
+                CommittedTimeline.draft_timeline_id == draft_timeline_id
+            ).first()
+            
+            if existing_commit:
+                raise TimelineAlreadyCommittedError(
+                    f"Draft timeline {draft_timeline_id} has already been committed. "
+                    f"Committed timeline ID: {existing_commit.id}. "
+                    f"Cannot commit the same draft timeline twice."
+                )
+            
+            # Also check if draft is already frozen
+            if not draft_timeline.is_active:
+                raise TimelineImmutableError(
+                    f"Draft timeline {draft_timeline_id} is already frozen (inactive). "
+                    f"It may have been committed previously."
+                )
+            
+            step.details = {
+                "already_committed": False,
+                "is_active": draft_timeline.is_active
+            }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="recommit_check",
+                data={
+                    "already_committed": False,
+                    "is_active": draft_timeline.is_active
+                },
+                source=f"DraftTimeline:{draft_timeline_id}",
+                confidence=1.0
+            )
+        
+        # Step 4: Capture edit history
         with self._trace_step("capture_edit_history") as step:
             edit_history = self.db.query(TimelineEditHistory).filter(
                 TimelineEditHistory.draft_timeline_id == draft_timeline_id
@@ -723,13 +1014,26 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         
         # Step 5: Increment version
         with self._trace_step("increment_version") as step:
-            new_version = self._increment_version(draft_timeline.version_number or "1.0")
+            current_version = draft_timeline.version_number or "1.0"
+            new_version = self._increment_version(current_version)
+            
             step.details = {
-                "old_version": draft_timeline.version_number,
+                "old_version": current_version,
                 "new_version": new_version
             }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="version_increment",
+                data={
+                    "old_version": current_version,
+                    "new_version": new_version
+                },
+                source=f"DraftTimeline:{draft_timeline_id}",
+                confidence=1.0
+            )
         
-        # Step 6: Create committed timeline
+        # Step 6: Create CommittedTimeline (immutable)
         with self._trace_step("create_committed_timeline") as step:
             committed_timeline = self._create_committed_timeline_record(
                 draft_timeline=draft_timeline,
@@ -741,10 +1045,23 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
             
             step.details = {
                 "committed_timeline_id": str(committed_timeline.id),
-                "version": new_version
+                "version": new_version,
+                "is_immutable": True
             }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="committed_timeline_created",
+                data={
+                    "id": str(committed_timeline.id),
+                    "draft_timeline_id": str(draft_timeline_id),
+                    "version": new_version
+                },
+                source=f"CommittedTimeline:{committed_timeline.id}",
+                confidence=1.0
+            )
         
-        # Step 7: Copy stages and milestones
+        # Step 7: Copy stages and milestones to committed timeline
         with self._trace_step("copy_stages_and_milestones") as step:
             stage_mapping = self._copy_stages_to_committed(
                 draft_stages=draft_stages,
@@ -760,25 +1077,58 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 "stages_copied": len(stage_mapping),
                 "milestones_copied": total_milestones
             }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="content_copied",
+                data={
+                    "stages_copied": len(stage_mapping),
+                    "milestones_copied": total_milestones
+                },
+                source=f"CommittedTimeline:{committed_timeline.id}",
+                confidence=1.0
+            )
         
-        # Step 8: Mark draft as committed (freeze)
-        with self._trace_step("freeze_draft_timeline") as step:
+        # Step 8: Freeze content (mark draft as inactive)
+        with self._trace_step("freeze_content") as step:
             draft_timeline.is_active = False
             draft_timeline.notes = (
                 f"{draft_timeline.notes or ''}\n"
-                f"Status: {self.STATUS_COMMITTED} on {committed_timeline.created_at}\n"
-                f"Committed Timeline ID: {committed_timeline.id}"
+                f"Status: {self.STATUS_COMMITTED} on {datetime.utcnow().isoformat()}\n"
+                f"Committed Timeline ID: {committed_timeline.id}\n"
+                f"Version: {new_version}"
             )
             self.db.add(draft_timeline)
             
-            step.details = {"frozen": True}
+            step.details = {
+                "frozen": True,
+                "is_active": False,
+                "status": self.STATUS_COMMITTED
+            }
+            
+            # Add evidence
+            self.add_evidence(
+                evidence_type="draft_frozen",
+                data={
+                    "draft_timeline_id": str(draft_timeline_id),
+                    "is_active": False,
+                    "committed_timeline_id": str(committed_timeline.id)
+                },
+                source=f"DraftTimeline:{draft_timeline_id}",
+                confidence=1.0
+            )
         
-        # Step 9: Commit transaction
-        with self._trace_step("commit_transaction"):
+        # Step 9: Persist all changes
+        with self._trace_step("persist_changes"):
             self.db.commit()
             self.db.refresh(committed_timeline)
+            self.db.refresh(draft_timeline)
         
-        # Step 10: Build UI response
+        # Step 10: Write DecisionTrace (automatic via BaseOrchestrator.execute())
+        # The BaseOrchestrator.execute() method automatically writes DecisionTrace
+        # after _execute_commit_pipeline completes successfully
+        
+        # Build UI response
         response = self._build_commit_response(
             committed_timeline=committed_timeline,
             draft_timeline=draft_timeline,

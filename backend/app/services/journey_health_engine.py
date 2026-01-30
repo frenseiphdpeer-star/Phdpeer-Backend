@@ -90,10 +90,21 @@ class JourneyHealthEngine:
     """
     Rule-based engine for assessing PhD journey health.
     
-    Takes questionnaire responses and applies deterministic scoring
-    rules to calculate health dimensions and generate recommendations.
+    Rules:
+    - Deterministic scoring: Pure mathematical calculations, no randomness
+    - Dimension-wise scores (0-100): Each dimension scored independently
+    - Threshold-based classification: Status determined by score thresholds
+    - Rule-to-recommendation mapping: Structured templates, no free-text
+    - No free-text logic: All outputs use predefined templates
+    
+    Capabilities:
+    - Convert 1-5 scale responses to 0-100 dimension scores
+    - Classify dimensions using threshold-based status (excellent to critical)
+    - Generate recommendations using rule-based templates
+    - Calculate weighted overall score
     
     No document access, no timeline access, no writing evaluation.
+    No ML, no free-text generation, no randomness.
     """
     
     # Score thresholds for status determination
@@ -153,24 +164,43 @@ class JourneyHealthEngine:
         """
         Assess journey health from questionnaire responses.
         
+        Rules:
+        - Deterministic scoring: Pure mathematical calculations
+        - Dimension-wise scores (0-100): Each dimension scored independently
+        - Threshold-based classification: Status determined by score thresholds
+        - Rule-to-recommendation mapping: Structured templates only
+        - No free-text logic: All outputs use predefined templates
+        
+        Process:
+        1. Calculate dimension-wise scores (0-100) from responses
+        2. Classify each dimension using threshold-based status
+        3. Calculate weighted overall score
+        4. Generate recommendations using rule-to-recommendation mapping
+        
         Args:
-            responses: List of questionnaire responses
+            responses: List of questionnaire responses (1-5 scale)
             assessment_date: Optional date string
             
         Returns:
-            JourneyHealthReport with scores and recommendations
+            JourneyHealthReport with:
+            - Overall score (0-100) and status
+            - Dimension scores (0-100) with status for each
+            - Recommendations (from structured templates)
+            - Strengths and concerns (rule-based)
         """
         if not responses:
             raise ValueError("No questionnaire responses provided")
         
-        # Calculate dimension scores
+        # Step 1: Calculate dimension-wise scores (0-100)
         dimension_scores = self._calculate_dimension_scores(responses)
         
-        # Calculate overall score
+        # Step 2: Calculate overall score (deterministic weighted average)
         overall_score = self._calculate_overall_score(dimension_scores)
+        
+        # Step 3: Threshold-based classification
         overall_status = self._determine_status(overall_score)
         
-        # Generate recommendations
+        # Step 4: Rule-to-recommendation mapping
         recommendations = self._generate_recommendations(dimension_scores)
         
         return JourneyHealthReport(
@@ -216,17 +246,21 @@ class JourneyHealthEngine:
         responses: List[QuestionResponse]
     ) -> DimensionScore:
         """
-        Score a single dimension from its responses.
+        Score a single dimension from its responses (dimension-wise scoring).
         
-        Assumes responses are on 1-5 scale.
-        Converts to 0-100 scale.
+        Deterministic scoring: Pure mathematical calculation.
+        Dimension-wise scores (0-100): Converts 1-5 scale to 0-100.
+        
+        Formula:
+        - Convert each response: score = ((response_value - 1) / 4) * 100
+        - Average all responses for the dimension
         
         Args:
             dimension: Health dimension
             responses: Responses for this dimension
             
         Returns:
-            DimensionScore object
+            DimensionScore object with score (0-100) and status
         """
         if not responses:
             return DimensionScore(
@@ -236,22 +270,25 @@ class JourneyHealthEngine:
                 response_count=0,
             )
         
-        # Convert 1-5 scale to 0-100
+        # Deterministic scoring: Convert 1-5 scale to 0-100
+        # Formula: score = ((response_value - 1) / 4) * 100
         # 1 -> 0, 2 -> 25, 3 -> 50, 4 -> 75, 5 -> 100
         values = [((r.response_value - 1) / 4) * 100 for r in responses]
+        
+        # Dimension-wise score: Average of all responses for this dimension
         average_score = sum(values) / len(values)
         
-        # Determine status
+        # Threshold-based classification
         status = self._determine_status(average_score)
         
-        # Identify strengths and concerns
+        # Identify strengths and concerns (using structured rules, no free-text)
         strengths = self._identify_strengths(dimension, responses)
         concerns = self._identify_concerns(dimension, responses)
         
         return DimensionScore(
             dimension=dimension,
-            score=round(average_score, 1),
-            status=status,
+            score=round(average_score, 1),  # Dimension-wise score (0-100)
+            status=status,  # Threshold-based classification
             response_count=len(responses),
             strengths=strengths,
             concerns=concerns,
@@ -259,14 +296,25 @@ class JourneyHealthEngine:
     
     def _determine_status(self, score: float) -> HealthStatus:
         """
-        Determine health status from score.
+        Determine health status using threshold-based classification.
+        
+        Threshold-based classification: Uses fixed score thresholds.
+        Deterministic: Same score always produces same status.
+        
+        Thresholds:
+        - Excellent: score >= 80
+        - Good: score >= 65
+        - Fair: score >= 50
+        - Concerning: score >= 35
+        - Critical: score < 35
         
         Args:
             score: Score (0-100)
             
         Returns:
-            HealthStatus enum value
+            HealthStatus enum value (determined by thresholds)
         """
+        # Threshold-based classification (deterministic)
         if score >= self.THRESHOLDS[HealthStatus.EXCELLENT]:
             return HealthStatus.EXCELLENT
         elif score >= self.THRESHOLDS[HealthStatus.GOOD]:
@@ -283,11 +331,25 @@ class JourneyHealthEngine:
         dimension: HealthDimension,
         responses: List[QuestionResponse]
     ) -> List[str]:
-        """Identify strengths in a dimension (high scores)."""
+        """
+        Identify strengths using rule-based logic (no free-text).
+        
+        Rule: If ≥60% of responses are 4 or 5, mark as strength.
+        Uses structured template, no free-text generation.
+        
+        Args:
+            dimension: Health dimension
+            responses: Responses for this dimension
+            
+        Returns:
+            List of structured strength descriptions
+        """
         strengths = []
         high_responses = [r for r in responses if r.response_value >= 4]
         
+        # Rule-based: ≥60% high responses = strength
         if len(high_responses) >= len(responses) * 0.6:
+            # Structured template (no free-text)
             strengths.append(f"Strong {dimension.value.replace('_', ' ')}")
         
         return strengths
@@ -297,11 +359,25 @@ class JourneyHealthEngine:
         dimension: HealthDimension,
         responses: List[QuestionResponse]
     ) -> List[str]:
-        """Identify concerns in a dimension (low scores)."""
+        """
+        Identify concerns using rule-based logic (no free-text).
+        
+        Rule: If ≥40% of responses are 1 or 2, mark as concern.
+        Uses structured template, no free-text generation.
+        
+        Args:
+            dimension: Health dimension
+            responses: Responses for this dimension
+            
+        Returns:
+            List of structured concern descriptions
+        """
         concerns = []
         low_responses = [r for r in responses if r.response_value <= 2]
         
+        # Rule-based: ≥40% low responses = concern
         if len(low_responses) >= len(responses) * 0.4:
+            # Structured template (no free-text)
             concerns.append(f"Low {dimension.value.replace('_', ' ')}")
         
         return concerns
@@ -311,15 +387,16 @@ class JourneyHealthEngine:
         dimension_scores: Dict[HealthDimension, DimensionScore]
     ) -> float:
         """
-        Calculate overall health score from dimension scores.
+        Calculate overall health score using deterministic weighted average.
         
-        Applies weights to different dimensions.
+        Deterministic scoring: Pure mathematical calculation.
+        Formula: overall = sum(dimension_score * weight) / sum(weights)
         
         Args:
-            dimension_scores: Dictionary of dimension scores
+            dimension_scores: Dictionary of dimension scores (0-100 each)
             
         Returns:
-            Overall score (0-100)
+            Overall score (0-100), weighted average of dimension scores
         """
         if not dimension_scores:
             return 0.0
@@ -327,11 +404,13 @@ class JourneyHealthEngine:
         total_weighted_score = 0.0
         total_weight = 0.0
         
+        # Deterministic scoring: Weighted average
         for dimension, score in dimension_scores.items():
             weight = self.DIMENSION_RULES.get(dimension, {}).get("weight", 1.0)
             total_weighted_score += score.score * weight
             total_weight += weight
         
+        # Deterministic calculation
         overall = total_weighted_score / total_weight if total_weight > 0 else 0.0
         return round(overall, 1)
     
@@ -340,33 +419,43 @@ class JourneyHealthEngine:
         dimension_scores: Dict[HealthDimension, DimensionScore]
     ) -> List[HealthRecommendation]:
         """
-        Generate recommendations based on dimension scores.
+        Generate recommendations using rule-to-recommendation mapping.
         
-        Uses rule-based logic to suggest improvements.
+        Rule-to-recommendation mapping:
+        - Critical status → High priority recommendation
+        - Concerning status → Medium priority recommendation
+        - Fair status → Low priority recommendation
+        - Good/Excellent status → No recommendation
+        
+        No free-text logic: All recommendations use structured templates.
+        Deterministic: Same scores always produce same recommendations.
         
         Args:
             dimension_scores: Dictionary of dimension scores
             
         Returns:
-            List of recommendations
+            List of recommendations (sorted by priority)
         """
         recommendations = []
         
         for dimension, score in dimension_scores.items():
-            # Generate recommendations for low-scoring dimensions
+            # Rule-to-recommendation mapping: Status → Priority
             if score.status in [HealthStatus.CRITICAL, HealthStatus.CONCERNING]:
+                # Threshold-based: Critical/Concerning → High/Medium priority
                 priority = "high" if score.status == HealthStatus.CRITICAL else "medium"
                 recommendation = self._generate_dimension_recommendation(
                     dimension, score, priority
                 )
                 recommendations.append(recommendation)
             elif score.status == HealthStatus.FAIR:
+                # Threshold-based: Fair → Low priority
                 recommendation = self._generate_dimension_recommendation(
                     dimension, score, "low"
                 )
                 recommendations.append(recommendation)
+            # Good/Excellent: No recommendations (rule-based)
         
-        # Sort by priority
+        # Sort by priority (deterministic ordering)
         priority_order = {"high": 0, "medium": 1, "low": 2}
         recommendations.sort(key=lambda r: priority_order[r.priority])
         
@@ -379,15 +468,19 @@ class JourneyHealthEngine:
         priority: str
     ) -> HealthRecommendation:
         """
-        Generate a specific recommendation for a dimension.
+        Generate recommendation using rule-to-recommendation mapping.
+        
+        Rule-to-recommendation mapping: Each dimension has predefined templates.
+        No free-text logic: All recommendations use structured templates.
+        Deterministic: Same dimension + status = same recommendation.
         
         Args:
             dimension: Health dimension
-            score: Dimension score
-            priority: Priority level
+            score: Dimension score (for context)
+            priority: Priority level (high, medium, low)
             
         Returns:
-            HealthRecommendation object
+            HealthRecommendation object (from structured template)
         """
         # Dimension-specific recommendations
         templates = {

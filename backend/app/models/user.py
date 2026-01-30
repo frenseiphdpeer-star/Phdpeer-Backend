@@ -71,3 +71,8 @@ class User(Base, BaseModel):
         back_populates="user",
         cascade="all, delete-orphan"
     )
+    analytics_snapshots = relationship(
+        "AnalyticsSnapshot",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )

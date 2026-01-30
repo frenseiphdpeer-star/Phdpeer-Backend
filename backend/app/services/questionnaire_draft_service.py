@@ -21,15 +21,21 @@ class QuestionnaireVersionError(Exception):
 
 class QuestionnaireDraftService:
     """
-    Service for managing questionnaire drafts.
+    Service for managing questionnaire drafts and versions.
     
-    Supports:
+    Rules:
+    - Section-wise saving: Save responses section by section
+    - Resume allowed: Users can resume drafts at any time
+    - Submission locks responses: Once submitted, drafts are immutable
+    - Version questionnaires: Support multiple questionnaire versions
+    - No scoring yet: Scoring logic is not implemented in this service
+    
+    Capabilities:
     - Section-by-section saving
     - Draft resumption
     - Version management
     - Progress tracking
-    
-    No scoring before submission.
+    - Submission locking
     """
     
     def __init__(self, db: Session):
@@ -110,7 +116,12 @@ class QuestionnaireDraftService:
         is_section_complete: bool = False
     ) -> Dict[str, Any]:
         """
-        Save responses for a specific section.
+        Save responses for a specific section (section-wise saving).
+        
+        Rules:
+        - Section-wise saving: Only updates the specified section
+        - Submission locks responses: Cannot edit if already submitted
+        - Resume allowed: Can save to any section at any time (if not submitted)
         
         Args:
             draft_id: Draft ID
@@ -123,7 +134,7 @@ class QuestionnaireDraftService:
             Updated draft summary
             
         Raises:
-            QuestionnaireDraftError: If validation fails
+            QuestionnaireDraftError: If validation fails or draft is submitted
         """
         # Get draft
         draft = self.db.query(QuestionnaireDraft).filter(
@@ -136,21 +147,25 @@ class QuestionnaireDraftService:
                 f"Draft {draft_id} not found or not owned by user {user_id}"
             )
         
+        # Submission locks responses - prevent any edits after submission
         if draft.is_submitted:
-            raise QuestionnaireDraftError("Cannot edit submitted draft")
+            raise QuestionnaireDraftError(
+                "Cannot edit submitted draft. Submission locks all responses."
+            )
         
-        # Update responses
+        # Section-wise saving: Update only the specified section
         current_responses = draft.responses_json or {}
         
-        # Merge section responses
+        # Merge section responses (section-wise update)
         if section_id not in current_responses:
             current_responses[section_id] = {}
         
+        # Update section responses (merge with existing)
         current_responses[section_id].update(responses)
         draft.responses_json = current_responses
         
-        # Update completed sections
-        completed_sections = draft.completed_sections or []
+        # Update completed sections list
+        completed_sections = list(draft.completed_sections or [])
         if is_section_complete and section_id not in completed_sections:
             completed_sections.append(section_id)
             draft.completed_sections = completed_sections
@@ -158,8 +173,10 @@ class QuestionnaireDraftService:
             completed_sections.remove(section_id)
             draft.completed_sections = completed_sections
         
-        # Update progress
+        # Update progress percentage
         draft.progress_percentage = self._calculate_progress(draft)
+        
+        # Track last edited section (for resume functionality)
         draft.last_section_edited = section_id
         
         self.db.add(draft)
@@ -174,7 +191,9 @@ class QuestionnaireDraftService:
         user_id: UUID
     ) -> Optional[Dict[str, Any]]:
         """
-        Get a draft by ID.
+        Get a draft by ID (for resuming).
+        
+        Resume allowed: Users can retrieve and continue working on drafts.
         
         Args:
             draft_id: Draft ID
@@ -192,6 +211,53 @@ class QuestionnaireDraftService:
             return None
         
         return self._draft_to_dict(draft)
+    
+    def resume_draft(
+        self,
+        draft_id: UUID,
+        user_id: UUID
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resume a draft (get draft with resume context).
+        
+        Resume allowed: Users can resume drafts at any time (if not submitted).
+        Returns draft with information about where to resume.
+        
+        Args:
+            draft_id: Draft ID
+            user_id: User ID (for ownership verification)
+            
+        Returns:
+            Draft dictionary with resume information, or None if not found
+            
+        Raises:
+            QuestionnaireDraftError: If draft is submitted (cannot resume)
+        """
+        draft = self.db.query(QuestionnaireDraft).filter(
+            QuestionnaireDraft.id == draft_id,
+            QuestionnaireDraft.user_id == user_id
+        ).first()
+        
+        if not draft:
+            return None
+        
+        # Submission locks responses - cannot resume submitted drafts
+        if draft.is_submitted:
+            raise QuestionnaireDraftError(
+                "Cannot resume submitted draft. Submission locks all responses."
+            )
+        
+        draft_dict = self._draft_to_dict(draft)
+        
+        # Add resume context
+        draft_dict["resume_info"] = {
+            "last_section_edited": draft.last_section_edited,
+            "completed_sections": draft.completed_sections or [],
+            "can_resume": True,
+            "is_submitted": False
+        }
+        
+        return draft_dict
     
     def get_user_drafts(
         self,
@@ -231,6 +297,9 @@ class QuestionnaireDraftService:
         """
         Delete a draft.
         
+        Rules:
+        - Submission locks responses: Cannot delete submitted drafts
+        
         Args:
             draft_id: Draft ID
             user_id: User ID (for ownership verification)
@@ -239,7 +308,7 @@ class QuestionnaireDraftService:
             True if deleted, False if not found
             
         Raises:
-            QuestionnaireDraftError: If draft is already submitted
+            QuestionnaireDraftError: If draft is already submitted (locked)
         """
         draft = self.db.query(QuestionnaireDraft).filter(
             QuestionnaireDraft.id == draft_id,
@@ -249,8 +318,11 @@ class QuestionnaireDraftService:
         if not draft:
             return False
         
+        # Submission locks responses - cannot delete submitted drafts
         if draft.is_submitted:
-            raise QuestionnaireDraftError("Cannot delete submitted draft")
+            raise QuestionnaireDraftError(
+                "Cannot delete submitted draft. Submission locks all responses."
+            )
         
         self.db.delete(draft)
         self.db.commit()
@@ -264,7 +336,13 @@ class QuestionnaireDraftService:
         submission_id: UUID
     ) -> Dict[str, Any]:
         """
-        Mark a draft as submitted.
+        Mark a draft as submitted (submission locks responses).
+        
+        Rules:
+        - Submission locks responses: After submission, draft becomes immutable
+        - Cannot edit: All future save_section() calls will fail
+        - Cannot delete: Draft cannot be deleted after submission
+        - Cannot resume: Draft cannot be resumed after submission
         
         Args:
             draft_id: Draft ID
@@ -272,10 +350,10 @@ class QuestionnaireDraftService:
             submission_id: ID of the JourneyAssessment created from this draft
             
         Returns:
-            Updated draft dictionary
+            Updated draft dictionary (now locked)
             
         Raises:
-            QuestionnaireDraftError: If validation fails
+            QuestionnaireDraftError: If validation fails or already submitted
         """
         draft = self.db.query(QuestionnaireDraft).filter(
             QuestionnaireDraft.id == draft_id,
@@ -290,6 +368,7 @@ class QuestionnaireDraftService:
         if draft.is_submitted:
             raise QuestionnaireDraftError("Draft already submitted")
         
+        # Submission locks responses - mark as submitted (immutable)
         draft.is_submitted = True
         draft.submission_id = submission_id
         
@@ -311,21 +390,27 @@ class QuestionnaireDraftService:
         is_active: bool = True
     ) -> UUID:
         """
-        Create a new questionnaire version.
+        Create a new questionnaire version (version questionnaires).
+        
+        Rules:
+        - Version questionnaires: Support multiple versions of questionnaire schema
+        - Each draft is tied to a specific version
+        - Only one active version at a time
+        - Versions can be deprecated but not deleted
         
         Args:
-            version_number: Version number (e.g., "1.0", "1.1")
+            version_number: Version number (e.g., "1.0", "1.1", "2.0")
             title: Version title
-            schema: Complete questionnaire schema
+            schema: Complete questionnaire schema (sections, questions, etc.)
             description: Optional description
             release_notes: Optional release notes
-            is_active: Whether this version is active
+            is_active: Whether this version is active (only one can be active)
             
         Returns:
             UUID of created version
             
         Raises:
-            QuestionnaireVersionError: If validation fails
+            QuestionnaireVersionError: If validation fails or version exists
         """
         # Check if version already exists
         existing = self.db.query(QuestionnaireVersion).filter(

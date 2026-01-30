@@ -38,6 +38,25 @@ from app.services.journey_health_engine import (
     HealthStatus,
     HealthDimension,
 )
+from app.services.analytics_engine import (
+    AnalyticsEngine,
+    TimeSeriesPoint,
+    TimeSeriesSummary,
+    StatusIndicator,
+    AnalyticsReport,
+)
+from app.services.sal_engine import (
+    SALEngine,
+    SALEngineError,
+)
+from app.services.cpa_engine import (
+    CPAEngine,
+    CPAEngineError,
+)
+from app.services.nmx_engine import (
+    NMXEngine,
+    NMXEngineError,
+)
 
 __all__ = [
     "DocumentService",
@@ -59,4 +78,15 @@ __all__ = [
     "JourneyHealthReport",
     "HealthStatus",
     "HealthDimension",
+    "AnalyticsEngine",
+    "TimeSeriesPoint",
+    "TimeSeriesSummary",
+    "StatusIndicator",
+    "AnalyticsReport",
+    "SALEngine",
+    "SALEngineError",
+    "CPAEngine",
+    "CPAEngineError",
+    "NMXEngine",
+    "NMXEngineError",
 ]

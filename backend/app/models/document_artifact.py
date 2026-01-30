@@ -22,7 +22,8 @@ class DocumentArtifact(Base, BaseModel):
         file_path: Storage path or URL of the document
         file_size_bytes: Size of the file in bytes
         document_type: Type of document (proposal, paper, report, etc.)
-        document_text: Normalized extracted text
+        raw_text: Raw extracted text (before normalization)
+        document_text: Normalized extracted text (after processing)
         word_count: Number of words in the document
         detected_language: ISO 639-1 language code (e.g., 'en', 'es')
         section_map_json: Structured section map with headings and content ranges
@@ -45,10 +46,11 @@ class DocumentArtifact(Base, BaseModel):
     document_type = Column(String, nullable=True)
     
     # Enhanced text processing fields
-    document_text = Column(Text, nullable=True)
+    raw_text = Column(Text, nullable=True)  # Raw extracted text (before normalization)
+    document_text = Column(Text, nullable=True)  # Normalized text (after processing)
     word_count = Column(Integer, nullable=True)
     detected_language = Column(String(10), nullable=True)
-    section_map_json = Column(JSONB, nullable=True)
+    section_map_json = Column(JSONB, nullable=True)  # Section map with headings + heuristics
     
     # Note: renamed from 'metadata' to avoid SQLAlchemy reserved keyword
     document_metadata = Column(JSONB, nullable=True)

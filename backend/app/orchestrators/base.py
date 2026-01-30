@@ -26,7 +26,12 @@ from app.models.idempotency import (
     EvidenceBundle,
     RequestStatus
 )
-from app.utils.invariants import check_idempotency_key_unique, DuplicateIdempotentActionError
+from app.utils.invariants import (
+    check_no_duplicate_execution,
+    validate_request_id,
+    validate_orchestrator_name,
+    DuplicateExecutionError
+)
 
 
 # Type variable for orchestrator result
@@ -114,8 +119,6 @@ class EvidenceCollector:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
         return {
-            "event_id": self.event_id,
-            "orchestrator": self.orchestrator_name,
             "evidence": self.evidence_items,
             "metadata": self.metadata
         }
@@ -208,13 +211,16 @@ class BaseOrchestrator(ABC, Generic[T]):
         """
         Execute the orchestration with idempotency guarantees.
         
-        Flow:
-        1. Check idempotency key
+        Executes steps in a fixed, explicit order:
+        1. Check idempotency key in database
         2. If duplicate completed request: return cached response
         3. If duplicate in-flight request: raise error
-        4. If new request: execute pipeline
-        5. Persist decision traces and evidence
-        6. Cache response
+        4. Create new idempotency key record
+        5. Mark as processing
+        6. Execute pipeline with step-by-step tracing
+        7. Serialize result
+        8. Persist DecisionTrace (structured JSON)
+        9. Mark as completed and cache response
         
         Args:
             request_id: Unique request identifier (idempotency key)
@@ -228,6 +234,13 @@ class BaseOrchestrator(ABC, Generic[T]):
             DuplicateRequestError: If request is already being processed
             OrchestrationError: If orchestration fails
         """
+        # Validate inputs (fail fast)
+        try:
+            validate_request_id(request_id)
+            validate_orchestrator_name(self.orchestrator_name)
+        except ValueError as e:
+            raise OrchestrationError(f"Invalid input: {str(e)}") from e
+        
         self._current_request_id = request_id
         self._start_time = time.time()
         self._execution_steps = []
@@ -235,65 +248,78 @@ class BaseOrchestrator(ABC, Generic[T]):
         self._step_counter = 0
         
         try:
-            # Step 1: Check idempotency invariant
-            cached_result = check_idempotency_key_unique(
-                db=self.db,
-                key=request_id,
-                orchestrator_name=self.orchestrator_name,
-                allow_completed=True
-            )
+            # Step 1: Check idempotency key in database
+            with self._trace_step("check_idempotency"):
+                existing_key = self._get_idempotency_key(request_id)
+                
+                if existing_key:
+                    # Handle duplicate request based on status
+                    cached_result = self._handle_duplicate_request(existing_key)
+                    if cached_result is not None:
+                        # Return cached result (COMPLETED case)
+                        return cached_result
+                    # If None, failed record was deleted and we proceed with new execution
+                
+                # Step 1b: Global invariant check - No duplicate execution (for in-flight only)
+                # This ensures no PROCESSING duplicates slip through
+                if not existing_key or existing_key.status != RequestStatus.COMPLETED:
+                    try:
+                        check_no_duplicate_execution(
+                            db=self.db,
+                            request_id=request_id,
+                            orchestrator_name=self.orchestrator_name,
+                            allow_completed=False  # Fail on PROCESSING duplicates
+                        )
+                    except DuplicateExecutionError as e:
+                        # Fail fast with explicit error
+                        raise OrchestrationError(f"Duplicate execution prevented: {str(e)}") from e
             
-            if cached_result is not None:
-                # Return cached result for completed operation
-                return self._deserialize_result(cached_result)
+            # Step 3: Create new idempotency key record
+            with self._trace_step("create_idempotency_key"):
+                idempotency_key = self._create_idempotency_key(
+                    request_id=request_id,
+                    input_data=input_data,
+                    ttl_hours=ttl_hours
+                )
             
-            # Step 2: Check for existing request (should not happen if invariant check passed)
-            existing_key = self._get_idempotency_key(request_id)
-            
-            if existing_key:
-                # Handle duplicate request
-                return self._handle_duplicate_request(existing_key)
-            
-            # Step 2: Create new idempotency key
-            idempotency_key = self._create_idempotency_key(
-                request_id=request_id,
-                input_data=input_data,
-                ttl_hours=ttl_hours
-            )
-            
-            # Step 3: Mark as processing
-            self._update_status(idempotency_key, RequestStatus.PROCESSING)
+            # Step 4: Mark as processing
+            with self._trace_step("mark_processing"):
+                self._update_status(idempotency_key, RequestStatus.PROCESSING)
             
             try:
-                # Step 4: Execute the pipeline with automatic tracing
-                context = self._prepare_context(input_data)
-                
+                # Step 5: Prepare execution context
                 with self._trace_step("prepare_context"):
-                    pass  # Already done above
+                    context = self._prepare_context(input_data)
                 
+                # Step 6: Execute the pipeline
                 with self._trace_step("execute_pipeline"):
                     result = self._execute_pipeline(context)
                 
-                # Step 5: Serialize result
-                response_data = self._serialize_result(result)
+                # Step 7: Serialize result for caching
+                with self._trace_step("serialize_result"):
+                    response_data = self._serialize_result(result)
                 
-                # Step 6: Persist trace and evidence
-                self._persist_trace_and_evidence()
+                # Step 8: Persist DecisionTrace (structured JSON)
+                with self._trace_step("persist_trace"):
+                    self._persist_trace_and_evidence()
                 
-                # Step 7: Mark as completed and cache response
-                self._complete_request(
-                    idempotency_key=idempotency_key,
-                    response_data=response_data,
-                    result=result
-                )
+                # Step 9: Mark as completed and cache response
+                with self._trace_step("complete_request"):
+                    self._complete_request(
+                        idempotency_key=idempotency_key,
+                        response_data=response_data,
+                        result=result
+                    )
                 
                 self.db.commit()
                 return result
                 
             except Exception as e:
                 # Mark as failed and persist trace
-                self._persist_trace_and_evidence(error=str(e))
-                self._fail_request(idempotency_key, e)
+                with self._trace_step("handle_error"):
+                    self._persist_trace_and_evidence(error=str(e))
+                    self._fail_request(idempotency_key, e)
+                
                 self.db.commit()
                 raise
         
@@ -313,14 +339,17 @@ class BaseOrchestrator(ABC, Generic[T]):
             )
         ).first()
     
-    def _handle_duplicate_request(self, existing_key: IdempotencyKey) -> T:
+    def _handle_duplicate_request(self, existing_key: IdempotencyKey) -> Optional[T]:
         """
         Handle duplicate request based on current status.
         
         - COMPLETED: Return cached response
         - PROCESSING: Raise error (duplicate in-flight)
-        - FAILED: Allow retry by raising error
+        - FAILED: Delete failed record and return None to allow retry
         - PENDING: Should not happen, raise error
+        
+        Returns:
+            Cached result if COMPLETED, None if FAILED (allows retry), raises error otherwise
         """
         if existing_key.status == RequestStatus.COMPLETED:
             # Return cached response
@@ -336,10 +365,11 @@ class BaseOrchestrator(ABC, Generic[T]):
             )
         
         elif existing_key.status == RequestStatus.FAILED:
-            # Allow retry by raising the original error
-            raise OrchestrationError(
-                f"Previous request failed: {existing_key.error_message}"
-            )
+            # Allow retry by deleting the failed record
+            self.db.delete(existing_key)
+            self.db.flush()
+            # Return None to indicate we should proceed with new execution
+            return None
         
         else:
             # Pending status should not exist for long
@@ -526,13 +556,14 @@ class BaseOrchestrator(ABC, Generic[T]):
         """
         Persist execution trace and evidence to database.
         
+        Automatically writes DecisionTrace and EvidenceBundle records.
+        Pure structured storage - no UI formatting.
+        
         Args:
             error: Error message if execution failed
         """
-        # Build trace JSON
+        # Build trace JSON (pure structured data)
         trace_json = {
-            "orchestrator": self.orchestrator_name,
-            "request_id": self._current_request_id,
             "started_at": datetime.fromtimestamp(self._start_time).isoformat(),
             "completed_at": datetime.utcnow().isoformat(),
             "duration_ms": self.get_elapsed_time_ms(),
@@ -549,18 +580,19 @@ class BaseOrchestrator(ABC, Generic[T]):
         
         # Create DecisionTrace record
         decision_trace = DecisionTrace(
-            event_id=self._current_request_id,
+            request_id=self._current_request_id,
+            orchestrator_name=self.orchestrator_name,
             trace_json=trace_json,
             created_at=datetime.utcnow()
         )
         self.db.add(decision_trace)
+        self.db.flush()  # Flush to get the ID
         
         # Create EvidenceBundle record if there's evidence
         if self._evidence_collector and self._evidence_collector.evidence_items:
             evidence_bundle = EvidenceBundle(
-                event_id=self._current_request_id,
-                evidence_json=self._evidence_collector.to_dict(),
-                created_at=datetime.utcnow()
+                decision_trace_id=decision_trace.id,
+                evidence_json=self._evidence_collector.to_dict()
             )
             self.db.add(evidence_bundle)
         

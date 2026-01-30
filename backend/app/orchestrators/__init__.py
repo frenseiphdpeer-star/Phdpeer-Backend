@@ -48,6 +48,15 @@ from app.orchestrators.timeline_orchestrator import (
 from app.orchestrators.phd_doctor_orchestrator import (
     PhDDoctorOrchestrator,
     PhDDoctorOrchestratorError,
+    IncompleteSubmissionError,
+)
+from app.orchestrators.analytics_orchestrator import (
+    AnalyticsOrchestrator,
+    AnalyticsOrchestratorError,
+)
+from app.orchestrators.writing_baseline_orchestrator import (
+    WritingBaselineOrchestrator,
+    WritingBaselineOrchestratorError,
 )
 
 __all__ = [
@@ -60,4 +69,9 @@ __all__ = [
     "TimelineImmutableError",
     "PhDDoctorOrchestrator",
     "PhDDoctorOrchestratorError",
+    "IncompleteSubmissionError",
+    "AnalyticsOrchestrator",
+    "AnalyticsOrchestratorError",
+    "WritingBaselineOrchestrator",
+    "WritingBaselineOrchestratorError",
 ]

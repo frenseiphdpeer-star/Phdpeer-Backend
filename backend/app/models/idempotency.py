@@ -6,7 +6,7 @@ Models for handling idempotent operations and request deduplication.
 
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text, Integer, Float
+from sqlalchemy import Column, String, DateTime, Text, Integer, Float, ForeignKey
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import enum
@@ -83,34 +83,18 @@ class DecisionTrace(Base):
     """
     Audit trail of orchestration execution.
     
-    Stores step-by-step execution logs as structured JSON:
-    {
-        "orchestrator": "baseline_orchestrator",
-        "request_id": "req-123",
-        "started_at": "2024-01-15T10:30:00",
-        "completed_at": "2024-01-15T10:30:05",
-        "duration_ms": 5000,
-        "steps": [
-            {
-                "step": 1,
-                "action": "validate_input",
-                "status": "success",
-                "timestamp": "2024-01-15T10:30:00",
-                "duration_ms": 10,
-                "details": {...}
-            },
-            ...
-        ],
-        "result": "success",
-        "metadata": {...}
-    }
+    Stores step-by-step execution logs as structured JSON in trace_json.
+    Pure structured storage - no UI formatting.
     """
     __tablename__ = "decision_traces"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     
-    # Event identifier (links to idempotency key request_id)
-    event_id = Column(String(255), nullable=False, unique=True, index=True)
+    # Request identifier (idempotency key)
+    request_id = Column(String(255), nullable=False, index=True)
+    
+    # Orchestrator that created this trace
+    orchestrator_name = Column(String(100), nullable=False, index=True)
     
     # Complete execution trace as structured JSON
     trace_json = Column(JSONB, nullable=False)
@@ -119,49 +103,26 @@ class DecisionTrace(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
     def __repr__(self):
-        return f"<DecisionTrace(event_id='{self.event_id}')>"
+        return f"<DecisionTrace(request_id='{self.request_id}', orchestrator='{self.orchestrator_name}')>"
 
 
 class EvidenceBundle(Base):
     """
     Evidence used during orchestration.
     
-    Stores evidence snippets as structured JSON:
-    {
-        "event_id": "req-123",
-        "orchestrator": "baseline_orchestrator",
-        "evidence": [
-            {
-                "type": "document_text",
-                "source": "DocumentArtifact:uuid",
-                "data": {...},
-                "confidence": 0.95,
-                "timestamp": "2024-01-15T10:30:01"
-            },
-            {
-                "type": "analysis_result",
-                "source": "TimelineIntelligenceEngine",
-                "data": {...},
-                "confidence": 0.85,
-                "timestamp": "2024-01-15T10:30:03"
-            },
-            ...
-        ],
-        "metadata": {...}
-    }
+    Stores evidence snippets as structured JSON in evidence_json.
+    Linked to DecisionTrace via foreign key.
+    Pure structured storage - no UI formatting.
     """
     __tablename__ = "evidence_bundles"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     
-    # Event identifier (links to idempotency key request_id)
-    event_id = Column(String(255), nullable=False, unique=True, index=True)
+    # Foreign key to DecisionTrace
+    decision_trace_id = Column(UUID(as_uuid=True), ForeignKey('decision_traces.id'), nullable=False, index=True)
     
     # Complete evidence bundle as structured JSON
     evidence_json = Column(JSONB, nullable=False)
-    
-    # Timestamp
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
     def __repr__(self):
-        return f"<EvidenceBundle(event_id='{self.event_id}')>"
+        return f"<EvidenceBundle(decision_trace_id='{self.decision_trace_id}')>"

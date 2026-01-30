@@ -22,8 +22,16 @@ class ProgressService:
     """
     Service for tracking and calculating timeline progress.
     
-    Handles milestone completion, progress event logging, and
-    simple date-based delay calculations.
+    Capabilities:
+    - Mark milestones completed
+    - Append ProgressEvent (append-only, immutable)
+    - Compute delay flags (planned vs actual)
+    
+    Rules:
+    - No prediction logic
+    - No ML algorithms
+    - Pure deterministic calculations
+    - ProgressEvent is append-only (never updated or deleted)
     """
     
     # Event types
@@ -110,22 +118,29 @@ class ProgressService:
         self.db.add(milestone)
         self.db.flush()
         
-        # Calculate delay
+        # Compute delay flags (planned vs actual)
         delay_days = self._calculate_delay_days(
             milestone.target_date,
             completion_date
         )
         
-        # Determine impact level based on delay
+        is_delayed = delay_days > 0
+        is_on_time = delay_days == 0
+        is_early = delay_days < 0
+        
+        # Determine impact level based on delay flags
         impact_level = self._determine_impact_level(delay_days, milestone.is_critical)
         
-        # Log progress event
+        # Build event description with delay information
         event_description = f"Completed milestone: {milestone.title}"
-        if delay_days > 0:
+        if is_delayed:
             event_description += f" (delayed by {delay_days} days)"
-        elif delay_days < 0:
+        elif is_early:
             event_description += f" (completed {abs(delay_days)} days early)"
+        elif is_on_time:
+            event_description += " (completed on time)"
         
+        # Append ProgressEvent (append-only, immutable)
         progress_event_id = self.log_progress_event(
             user_id=user_id,
             milestone_id=milestone_id,
@@ -137,6 +152,7 @@ class ProgressService:
             notes=notes,
         )
         
+        # Note: log_progress_event already commits, but we ensure milestone update is committed
         self.db.commit()
         
         return progress_event_id
@@ -154,7 +170,10 @@ class ProgressService:
         notes: Optional[str] = None,
     ) -> UUID:
         """
-        Log a progress event.
+        Append a progress event (append-only operation).
+        
+        ProgressEvent records are immutable once created - they can never be
+        updated or deleted. This ensures a complete audit trail.
         
         Args:
             user_id: ID of user logging the event
@@ -168,11 +187,20 @@ class ProgressService:
             notes: Optional notes
             
         Returns:
-            UUID of created ProgressEvent
+            UUID of created ProgressEvent (immutable, append-only)
+            
+        Raises:
+            ProgressServiceError: If validation fails
         """
+        # Verify user exists
+        user = self.db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise ProgressServiceError(f"User with ID {user_id} not found")
+        
         if event_date is None:
             event_date = date.today()
         
+        # Create new ProgressEvent (append-only, never updated)
         progress_event = ProgressEvent(
             user_id=user_id,
             milestone_id=milestone_id,
@@ -185,20 +213,59 @@ class ProgressService:
             notes=notes,
         )
         
+        # Append to database (immutable record)
         self.db.add(progress_event)
-        self.db.flush()
+        self.db.commit()
+        self.db.refresh(progress_event)
         
         return progress_event.id
+    
+    def compute_delay_flags(
+        self,
+        milestone_id: UUID
+    ) -> Optional[Dict]:
+        """
+        Compute delay flags by comparing planned vs actual dates.
+        
+        Pure deterministic calculation - no prediction, no ML.
+        Compares target_date (planned) with actual_completion_date (actual).
+        For incomplete milestones, compares target_date with today.
+        
+        Args:
+            milestone_id: Milestone ID
+            
+        Returns:
+            Dictionary with delay flags and status, or None if milestone not found
+            
+        Returns structure:
+        {
+            "milestone_id": UUID,
+            "milestone_title": str,
+            "is_completed": bool,
+            "is_critical": bool,
+            "planned_date": date,              # target_date (planned)
+            "actual_date": date,               # actual_completion_date or today
+            "delay_days": int,                 # Positive=delayed, Negative=early, Zero=on_time
+            "is_delayed": bool,                # True if delay_days > 0
+            "is_on_time": bool,                # True if delay_days == 0
+            "is_early": bool,                  # True if delay_days < 0
+            "status": str,                     # overdue, due_today, on_track, completed_on_time, completed_delayed, no_target_date
+            "has_target_date": bool
+        }
+        """
+        return self.calculate_milestone_delay(milestone_id)
     
     def calculate_milestone_delay(
         self,
         milestone_id: UUID
     ) -> Optional[Dict]:
         """
-        Calculate delay for a milestone.
+        Calculate delay for a milestone (planned vs actual).
         
-        Compares target date with actual completion date.
-        For incomplete milestones, compares target date with today.
+        Compares target_date (planned) with actual_completion_date (actual).
+        For incomplete milestones, compares target_date with today.
+        
+        Pure deterministic calculation - no prediction, no ML.
         
         Args:
             milestone_id: Milestone ID
@@ -243,15 +310,25 @@ class ProgressService:
                 status = "on_track"
             comparison_date = date.today()
         
+        # Compute delay flags
+        is_delayed = delay_days > 0
+        is_on_time = delay_days == 0
+        is_early = delay_days < 0
+        
         return {
             "milestone_id": milestone_id,
             "milestone_title": milestone.title,
             "is_completed": milestone.is_completed,
             "is_critical": milestone.is_critical,
-            "target_date": milestone.target_date,
+            "planned_date": milestone.target_date,  # target_date (planned)
+            "actual_date": comparison_date,  # actual_completion_date or today
+            "target_date": milestone.target_date,  # Alias for backward compatibility
             "actual_completion_date": milestone.actual_completion_date,
-            "comparison_date": comparison_date,
+            "comparison_date": comparison_date,  # Alias for backward compatibility
             "delay_days": delay_days,
+            "is_delayed": is_delayed,  # Delay flag: True if delayed
+            "is_on_time": is_on_time,  # Delay flag: True if on time
+            "is_early": is_early,  # Delay flag: True if early
             "status": status,
             "has_target_date": True,
         }
@@ -494,14 +571,16 @@ class ProgressService:
         include_completed: bool = False
     ) -> List[Dict]:
         """
-        Get all delayed milestones for a timeline.
+        Get all delayed milestones for a timeline using delay flag computation.
+        
+        Uses compute_delay_flags() to determine which milestones are delayed.
         
         Args:
             committed_timeline_id: Committed timeline ID
             include_completed: Whether to include completed but delayed milestones
             
         Returns:
-            List of delayed milestone information dicts
+            List of delayed milestone information dicts with delay flags
         """
         # Get all stages
         stages = self.db.query(TimelineStage).filter(
@@ -523,9 +602,11 @@ class ProgressService:
                 if milestone.is_completed and not include_completed:
                     continue
                 
-                delay_info = self.calculate_milestone_delay(milestone.id)
+                # Compute delay flags (planned vs actual)
+                delay_info = self.compute_delay_flags(milestone.id)
                 
-                if delay_info and delay_info["delay_days"] > 0:
+                # Only include milestones with is_delayed flag = True
+                if delay_info and delay_info.get("is_delayed", False):
                     delayed.append({
                         **delay_info,
                         "stage_id": str(stage.id),

@@ -33,13 +33,22 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
     """
     Orchestrator for PhD journey health assessments.
     
+    Rules:
+    - Isolation from timeline: No timeline data access
+    - Isolation from documents: No document data access
+    - Questionnaire-only: Only uses questionnaire responses
+    - Deterministic scoring: Pure rule-based calculations
+    
+    Steps:
+    1. Validate completeness
+    2. Compute scores
+    3. Persist JourneyAssessment
+    4. Write DecisionTrace (automatic via BaseOrchestrator)
+    
     Extends BaseOrchestrator to provide:
     - Idempotent submission
     - Decision tracing
     - Evidence bundling
-    
-    Coordinates questionnaire submission, health assessment,
-    and database storage.
     """
     
     @property
@@ -71,11 +80,15 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         Submit questionnaire with idempotency and tracing.
         
         Steps:
-        1. Validate submission completeness
-        2. Compute scores using JourneyHealthEngine
-        3. Store assessment snapshot
-        4. Store recommendations
-        5. Write DecisionTrace
+        1. Validate completeness
+        2. Compute scores
+        3. Persist JourneyAssessment
+        4. Write DecisionTrace (automatic via BaseOrchestrator)
+        
+        Isolation:
+        - No timeline access: Does not query or use timeline data
+        - No document access: Does not query or use document data
+        - Questionnaire-only: Only uses questionnaire responses
         
         Args:
             request_id: Idempotency key
@@ -107,13 +120,25 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         """
         Execute the submission pipeline.
         
-        This is the main pipeline method called by BaseOrchestrator.
+        Steps:
+        1. Validate completeness
+        2. Compute scores
+        3. Persist JourneyAssessment
+        4. Write DecisionTrace (automatic via BaseOrchestrator.execute())
+        
+        Isolation:
+        - No timeline access: Does not query timeline data
+        - No document access: Does not query document data
+        - Questionnaire-only: Only uses questionnaire responses
+        
+        This is called by BaseOrchestrator.execute() which automatically
+        writes DecisionTrace after successful completion.
         
         Args:
             context: Execution context with input data
             
         Returns:
-            Assessment summary
+            Assessment summary with scores and recommendations
         """
         user_id = UUID(context["user_id"])
         responses = context["responses"]
@@ -121,17 +146,25 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         assessment_type = context.get("assessment_type", "self_assessment")
         notes = context.get("notes")
         
-        # Step 1: Validate submission completeness
-        with self._trace_step("validate_submission") as step:
+        # Step 1: Validate completeness
+        with self._trace_step("validate_completeness") as step:
             self._validate_submission(user_id, responses, draft_id)
+            
             step.details = {
                 "user_id": str(user_id),
                 "total_responses": len(responses),
-                "has_draft": draft_id is not None
+                "has_draft": draft_id is not None,
+                "validation_passed": True
             }
+            
+            # Add evidence
             self.add_evidence(
-                evidence_type="validation_result",
-                data={"valid": True, "response_count": len(responses)},
+                evidence_type="completeness_validation",
+                data={
+                    "valid": True,
+                    "response_count": len(responses),
+                    "has_draft": draft_id is not None
+                },
                 source=f"User:{user_id}",
                 confidence=1.0
             )
@@ -144,81 +177,79 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
             is_explicit_submission=True
         )
         
-        # Step 2: Convert and validate responses
-        with self._trace_step("convert_responses") as step:
-            question_responses = self._convert_responses(responses)
-            step.details = {
-                "converted_count": len(question_responses),
-                "dimensions": list(set(r.dimension.value for r in question_responses))
-            }
-            self.add_evidence(
-                evidence_type="converted_responses",
-                data={
-                    "count": len(question_responses),
-                    "dimensions": [r.dimension.value for r in question_responses]
-                },
-                source="ResponseConverter",
-                confidence=1.0
-            )
+        # Convert responses to QuestionResponse objects
+        question_responses = self._convert_responses(responses)
         
-        # Step 3: Compute scores using JourneyHealthEngine
+        # Step 2: Compute scores
         with self._trace_step("compute_scores") as step:
+            # Isolation: Only uses questionnaire responses, no timeline/document access
             health_report = self.health_engine.assess_health(
                 responses=question_responses,
                 assessment_date=str(date.today())
             )
+            
             step.details = {
                 "overall_score": health_report.overall_score,
                 "overall_status": health_report.overall_status.value,
                 "dimensions_count": len(health_report.dimension_scores),
                 "recommendations_count": len(health_report.recommendations)
             }
+            
+            # Add evidence
             self.add_evidence(
-                evidence_type="health_scores",
+                evidence_type="computed_scores",
                 data={
                     "overall_score": health_report.overall_score,
                     "overall_status": health_report.overall_status.value,
                     "dimension_scores": {
                         d.value: s.score 
                         for d, s in health_report.dimension_scores.items()
-                    }
+                    },
+                    "isolation": "questionnaire_only"
                 },
                 source="JourneyHealthEngine",
                 confidence=1.0
             )
         
-        # Step 4: Store assessment snapshot
-        with self._trace_step("store_assessment") as step:
+        # Step 3: Persist JourneyAssessment
+        with self._trace_step("persist_journey_assessment") as step:
             assessment_id = self._store_assessment(
                 user_id=user_id,
                 health_report=health_report,
                 assessment_type=assessment_type,
                 notes=notes
             )
+            
             step.details = {
                 "assessment_id": str(assessment_id),
-                "assessment_type": assessment_type
+                "assessment_type": assessment_type,
+                "overall_score": health_report.overall_score
             }
+            
+            # Add evidence
             self.add_evidence(
-                evidence_type="stored_assessment",
-                data={"assessment_id": str(assessment_id)},
+                evidence_type="persisted_assessment",
+                data={
+                    "assessment_id": str(assessment_id),
+                    "overall_score": health_report.overall_score,
+                    "assessment_type": assessment_type
+                },
                 source=f"JourneyAssessment:{assessment_id}",
                 confidence=1.0
             )
         
-        # Step 5: Mark draft as submitted (if provided)
+        # Mark draft as submitted (if provided) - optional step
         if draft_id:
             with self._trace_step("mark_draft_submitted") as step:
                 self._mark_draft_submitted(draft_id, user_id, assessment_id)
                 step.details = {"draft_id": str(draft_id)}
         
-        # Step 6: Generate summary with recommendations
-        with self._trace_step("generate_summary") as step:
-            summary = self._generate_summary(assessment_id, health_report)
-            step.details = {
-                "recommendations_count": len(summary["recommendations"]),
-                "critical_areas_count": len(summary["critical_areas"])
-            }
+        # Step 4: Write DecisionTrace (automatic via BaseOrchestrator.execute())
+        # The BaseOrchestrator.execute() method automatically writes DecisionTrace
+        # after _execute_pipeline completes successfully
+        
+        # Generate summary for response
+        summary = self._generate_summary(assessment_id, health_report)
         
         return summary
     
@@ -229,7 +260,16 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         draft_id: Optional[UUID] = None
     ) -> None:
         """
-        Validate submission completeness.
+        Validate completeness of submission.
+        
+        Rules:
+        - User must exist
+        - Minimum responses required
+        - All responses must have required fields
+        - Response values must be valid (1-5)
+        - Draft must exist and not be submitted (if provided)
+        
+        Isolation: Only validates questionnaire data, no timeline/document access.
         
         Args:
             user_id: User ID
@@ -529,16 +569,19 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         notes: Optional[str],
     ) -> UUID:
         """
-        Store health assessment in database.
+        Persist JourneyAssessment to database.
+        
+        Isolation: Only stores questionnaire-based assessment data.
+        No timeline or document data is stored or referenced.
         
         Args:
             user_id: User ID
-            health_report: Health report from engine
+            health_report: Health report from JourneyHealthEngine
             assessment_type: Type of assessment
             notes: Optional notes
             
         Returns:
-            UUID of created assessment
+            UUID of created JourneyAssessment record
         """
         # Extract ratings from report
         overall_rating = int(health_report.overall_score)
@@ -552,7 +595,8 @@ class PhDDoctorOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 health_report.dimension_scores[HealthDimension.RESEARCH_PROGRESS].score
             )
         
-        # Timeline adherence can be approximated from time management
+        # Map time management dimension to timeline adherence rating
+        # Note: This is questionnaire-based only, no actual timeline data access
         if HealthDimension.TIME_MANAGEMENT in health_report.dimension_scores:
             timeline_rating = int(
                 health_report.dimension_scores[HealthDimension.TIME_MANAGEMENT].score

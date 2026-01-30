@@ -17,6 +17,7 @@ from app.models.journey_assessment import JourneyAssessment
 from app.models.idempotency import IdempotencyKey, DecisionTrace, EvidenceBundle
 from app.models.timeline_edit_history import TimelineEditHistory
 from app.models.questionnaire_draft import QuestionnaireDraft, QuestionnaireVersion
+from app.models.analytics_snapshot import AnalyticsSnapshot
 from app.models.opportunity import (
     OpportunityCatalog,
     OpportunityFeedSnapshot,
@@ -40,6 +41,7 @@ __all__ = [
     'TimelineEditHistory',
     'QuestionnaireDraft',
     'QuestionnaireVersion',
+    'AnalyticsSnapshot',
     'OpportunityCatalog',
     'OpportunityFeedSnapshot',
     'OpportunityFeedItem',
