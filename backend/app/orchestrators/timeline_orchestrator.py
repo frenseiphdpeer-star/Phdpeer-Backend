@@ -100,11 +100,14 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         Returns:
             UI-ready JSON response
         """
-        baseline_id = UUID(context['baseline_id'])
-        user_id = UUID(context['user_id'])
-        title = context.get('title')
-        description = context.get('description')
-        version_number = context.get('version_number', '1.0')
+        # Extract input data from context wrapper (BaseOrchestrator pattern)
+        input_data = context['input']
+        
+        baseline_id = UUID(input_data['baseline_id'])
+        user_id = UUID(input_data['user_id'])
+        title = input_data.get('title')
+        description = input_data.get('description')
+        version_number = input_data.get('version_number', '1.0')
         
         # Step 1: Validate baseline exists
         with self._trace_step("validate_baseline") as step:
@@ -132,7 +135,7 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 data={
                     "program_name": baseline.program_name,
                     "institution": baseline.institution,
-                    "program_type": baseline.program_type
+                    "field_of_study": baseline.field_of_study
                 },
                 source=f"Baseline:{baseline_id}",
                 confidence=1.0
@@ -860,10 +863,13 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         Returns:
             UI-ready JSON response
         """
-        draft_timeline_id = UUID(context['draft_timeline_id'])
-        user_id = UUID(context['user_id'])
-        title = context.get('title')
-        description = context.get('description')
+        # Extract input data from context wrapper (BaseOrchestrator pattern)
+        input_data = context['input']
+        
+        draft_timeline_id = UUID(input_data['draft_timeline_id'])
+        user_id = UUID(input_data['user_id'])
+        title = input_data.get('title')
+        description = input_data.get('description')
         
         # Step 1: Validate DraftTimeline must exist
         with self._trace_step("validate_draft_timeline_exists") as step:
@@ -1439,9 +1445,9 @@ class TimelineOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         """
         stage_records = []
         
-        # Create a mapping of stage descriptions to durations
+        # Create a mapping of stage descriptions to durations (use average of min/max)
         duration_map = {
-            est.item_description.lower(): est.duration_months
+            est.item_description.lower(): (est.duration_months_min + est.duration_months_max) // 2
             for est in duration_estimates
         }
         
