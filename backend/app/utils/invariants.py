@@ -84,6 +84,20 @@ class StateMutationInAnalyticsOrchestratorError(InvariantViolationError):
         super().__init__("state_mutation_in_analytics_orchestrator", message, details)
 
 
+class AnalyticsSnapshotMutationError(InvariantViolationError):
+    """Raised when attempting to modify an immutable AnalyticsSnapshot."""
+    
+    def __init__(self, message: str, details: dict = None):
+        super().__init__("analytics_snapshot_mutation", message, details)
+
+
+class AnalyticsSnapshotDeletionError(InvariantViolationError):
+    """Raised when attempting to delete an AnalyticsSnapshot."""
+    
+    def __init__(self, message: str, details: dict = None):
+        super().__init__("analytics_snapshot_deletion", message, details)
+
+
 class InvariantChecker:
     """
     Central invariant checker for system-wide validation.
@@ -670,6 +684,84 @@ class InvariantChecker:
                 )
 
 
+    def check_analytics_snapshot_not_modified(
+        self,
+        snapshot_id: UUID
+    ) -> None:
+        """
+        Invariant: AnalyticsSnapshot records are immutable.
+        
+        AnalyticsSnapshots must never be modified after creation.
+        They serve as immutable historical records of analytics state.
+        
+        Args:
+            snapshot_id: ID of snapshot being checked
+            
+        Raises:
+            AnalyticsSnapshotMutationError: If snapshot modification attempted
+        """
+        from app.models.analytics_snapshot import AnalyticsSnapshot
+        
+        # Check if snapshot exists
+        snapshot = self.db.query(AnalyticsSnapshot).filter(
+            AnalyticsSnapshot.id == snapshot_id
+        ).first()
+        
+        if not snapshot:
+            # Snapshot doesn't exist, no mutation check needed
+            return
+        
+        # This method exists as a documentation of the invariant
+        # In practice, application code should never call update/delete on snapshots
+        # Database-level constraints or triggers would be ideal for enforcement
+        
+        raise AnalyticsSnapshotMutationError(
+            f"Attempted to modify immutable AnalyticsSnapshot {snapshot_id}",
+            details={
+                "snapshot_id": str(snapshot_id),
+                "hint": "AnalyticsSnapshots are immutable. Create a new snapshot instead.",
+                "action": "Create new snapshot with updated data rather than modifying existing"
+            }
+        )
+    
+    def check_analytics_snapshot_not_deleted(
+        self,
+        snapshot_id: UUID
+    ) -> None:
+        """
+        Invariant: AnalyticsSnapshot records must not be deleted.
+        
+        Snapshots are historical records and should be preserved.
+        If cleanup is needed, use soft deletion or archival processes.
+        
+        Args:
+            snapshot_id: ID of snapshot being checked
+            
+        Raises:
+            AnalyticsSnapshotDeletionError: If snapshot deletion attempted
+        """
+        from app.models.analytics_snapshot import AnalyticsSnapshot
+        
+        # Check if snapshot exists
+        snapshot = self.db.query(AnalyticsSnapshot).filter(
+            AnalyticsSnapshot.id == snapshot_id
+        ).first()
+        
+        if not snapshot:
+            # Snapshot doesn't exist, might have been deleted
+            # or never existed
+            return
+        
+        raise AnalyticsSnapshotDeletionError(
+            f"Attempted to delete immutable AnalyticsSnapshot {snapshot_id}",
+            details={
+                "snapshot_id": str(snapshot_id),
+                "hint": "AnalyticsSnapshots should not be deleted. They are historical records.",
+                "action": "Use soft deletion or archival process if cleanup is needed"
+            }
+        )
+
+
 # Convenience functions for direct usage
 
 def check_committed_timeline_has_draft(
@@ -858,3 +950,46 @@ def check_no_state_mutation_in_analytics_orchestrator(
         operation,
         caller_context or {}
     )
+
+
+def check_analytics_snapshot_not_modified(
+    db: Session,
+    snapshot_id: UUID
+) -> None:
+    """
+    Invariant: AnalyticsSnapshot records are immutable.
+    
+    Utility helper for preventing snapshot modifications.
+    Fail fast with explicit error.
+    
+    Args:
+        db: Database session
+        snapshot_id: ID of snapshot to check
+        
+    Raises:
+        AnalyticsSnapshotMutationError: If snapshot modification attempted
+    """
+    checker = InvariantChecker(db)
+    checker.check_analytics_snapshot_not_modified(snapshot_id)
+
+
+def check_analytics_snapshot_not_deleted(
+    db: Session,
+    snapshot_id: UUID
+) -> None:
+    """
+    Invariant: AnalyticsSnapshot records must not be deleted.
+    
+    Utility helper for preventing snapshot deletions.
+    Fail fast with explicit error.
+    
+    Args:
+        db: Database session
+        snapshot_id: ID of snapshot to check
+        
+    Raises:
+        AnalyticsSnapshotDeletionError: If snapshot deletion attempted
+    """
+    checker = InvariantChecker(db)
+    checker.check_analytics_snapshot_not_deleted(snapshot_id)
+

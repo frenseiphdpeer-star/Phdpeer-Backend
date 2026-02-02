@@ -14,13 +14,15 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal, engine, Base
 from app.models import (
     User, DocumentArtifact, Baseline, DraftTimeline, CommittedTimeline,
-    TimelineStage, TimelineMilestone, ProgressEvent, JourneyAssessment
+    TimelineStage, TimelineMilestone, ProgressEvent, JourneyAssessment,
+    AnalyticsSnapshot
 )
 
 
 def clear_all_data(db: Session):
     """Clear all existing data (for demo purposes only)"""
     print("Clearing existing data...")
+    db.query(AnalyticsSnapshot).delete()
     db.query(ProgressEvent).delete()
     db.query(TimelineMilestone).delete()
     db.query(TimelineStage).delete()
@@ -90,11 +92,24 @@ def create_early_stage_phd(db: Session):
     )
     db.add(baseline)
     
+    # Draft Timeline (source for committed timeline)
+    draft_timeline = DraftTimeline(
+        id=uuid.UUID('11111111-3333-1111-1111-111111111110'),
+        user_id=sarah.id,
+        baseline_id=baseline.id,
+        title='Sarah\'s PhD Journey - ML Research',
+        description='5-year plan for PhD completion in Machine Learning',
+        version_number='1.0',
+        is_committed=True
+    )
+    db.add(draft_timeline)
+    
     # Committed Timeline
     timeline = CommittedTimeline(
         id=uuid.UUID('11111111-4444-1111-1111-111111111111'),
         user_id=sarah.id,
         baseline_id=baseline.id,
+        draft_timeline_id=draft_timeline.id,
         title='Sarah\'s PhD Journey - ML Research',
         description='5-year plan for PhD completion in Machine Learning',
         version_number='1.0',
@@ -257,11 +272,47 @@ def create_early_stage_phd(db: Session):
     )
     db.add(assessment)
     
+    # Analytics Snapshot - Early Stage
+    analytics_snapshot = AnalyticsSnapshot(
+        id=uuid.UUID('11111111-9999-1111-1111-111111111111'),
+        user_id=sarah.id,
+        timeline_version='1.0',
+        summary_json={
+            "timeline_id": str(timeline.id),
+            "user_id": str(sarah.id),
+            "generated_at": datetime.now().isoformat(),
+            "timeline_status": "on_track",
+            "milestone_completion_percentage": 40.0,
+            "total_milestones": 5,
+            "completed_milestones": 2,
+            "pending_milestones": 3,
+            "total_delays": 1,
+            "overdue_milestones": 0,
+            "overdue_critical_milestones": 0,
+            "average_delay_days": 10.0,
+            "max_delay_days": 10,
+            "latest_health_score": 4.2,
+            "health_dimensions": {
+                "momentum": 4.5,
+                "clarity": 4.0,
+                "support": 4.3,
+                "confidence": 4.0
+            },
+            "longitudinal_summary": {
+                "trend": "positive",
+                "velocity": "good",
+                "completion_forecast": "2029-01-15"
+            }
+        }
+    )
+    db.add(analytics_snapshot)
+    
     db.commit()
     print("✓ Early-stage PhD created: Sarah Chen")
     print("  - 6 months in, coursework completed")
     print("  - Developing research methodology")
     print("  - High motivation, some scope anxiety")
+    print("  - Analytics: 40% complete, on track")
 
 
 def create_mid_stage_phd(db: Session):
@@ -317,11 +368,24 @@ def create_mid_stage_phd(db: Session):
     )
     db.add(baseline)
     
+    # Draft Timeline (source for committed timeline)
+    draft_timeline = DraftTimeline(
+        id=uuid.UUID('22222222-2222-2222-2222-222222222220'),
+        user_id=marcus.id,
+        baseline_id=baseline.id,
+        title='Marcus\' PhD Timeline - NLP Research',
+        description='Research plan for neural dialogue systems',
+        version_number='2.0',
+        is_committed=True
+    )
+    db.add(draft_timeline)
+    
     # Committed Timeline
     timeline = CommittedTimeline(
         id=uuid.UUID('22222222-2222-2222-2222-222222222224'),
         user_id=marcus.id,
         baseline_id=baseline.id,
+        draft_timeline_id=draft_timeline.id,
         title='Marcus\' PhD Timeline - NLP Research',
         description='Research plan for neural dialogue systems',
         version_number='2.0',
@@ -485,11 +549,49 @@ def create_mid_stage_phd(db: Session):
     )
     db.add(assessment)
     
+    # Analytics Snapshot - Mid Stage
+    analytics_snapshot = AnalyticsSnapshot(
+        id=uuid.UUID('22222222-9999-2222-2222-222222222222'),
+        user_id=marcus.id,
+        timeline_version='1.0',
+        summary_json={
+            "timeline_id": str(timeline.id),
+            "user_id": str(marcus.id),
+            "generated_at": datetime.now().isoformat(),
+            "timeline_status": "at_risk",
+            "milestone_completion_percentage": 62.5,
+            "total_milestones": 8,
+            "completed_milestones": 5,
+            "pending_milestones": 3,
+            "total_delays": 3,
+            "overdue_milestones": 1,
+            "overdue_critical_milestones": 1,
+            "average_delay_days": 45.0,
+            "max_delay_days": 60,
+            "latest_health_score": 3.2,
+            "health_dimensions": {
+                "momentum": 2.5,
+                "clarity": 3.5,
+                "support": 3.0,
+                "confidence": 3.0,
+                "work_life_balance": 2.0
+            },
+            "longitudinal_summary": {
+                "trend": "concerning",
+                "velocity": "slow",
+                "completion_forecast": "2027-08-15",
+                "risk_factors": ["overdue_experiments", "burnout_indicators"]
+            }
+        }
+    )
+    db.add(analytics_snapshot)
+    
     db.commit()
     print("✓ Mid-stage PhD created: Marcus Johnson")
     print("  - 2.5 years in, some delays")
     print("  - Paper accepted, but experiments overdue")
     print("  - Managing stress and timeline pressure")
+    print("  - Analytics: 62.5% complete, at risk")
 
 
 def create_late_stage_phd(db: Session):
@@ -545,11 +647,24 @@ def create_late_stage_phd(db: Session):
     )
     db.add(baseline)
     
+    # Draft Timeline (source for committed timeline)
+    draft_timeline = DraftTimeline(
+        id=uuid.UUID('33333333-3333-3333-3333-333333333330'),
+        user_id=elena.id,
+        baseline_id=baseline.id,
+        title='Elena\'s PhD Timeline - Computer Vision',
+        description='Final year timeline focusing on dissertation completion',
+        version_number='3.0',
+        is_committed=True
+    )
+    db.add(draft_timeline)
+    
     # Committed Timeline
     timeline = CommittedTimeline(
         id=uuid.UUID('33333333-3333-3333-3333-333333333333'),
         user_id=elena.id,
         baseline_id=baseline.id,
+        draft_timeline_id=draft_timeline.id,
         title='Elena\'s PhD Timeline - Computer Vision',
         description='Final year timeline focusing on dissertation completion',
         version_number='3.0',
@@ -710,11 +825,54 @@ def create_late_stage_phd(db: Session):
     )
     db.add(assessment)
     
+    # Analytics Snapshot - Late Stage
+    analytics_snapshot = AnalyticsSnapshot(
+        id=uuid.UUID('33333333-9999-3333-3333-333333333333'),
+        user_id=elena.id,
+        timeline_version='1.0',
+        summary_json={
+            "timeline_id": str(timeline.id),
+            "user_id": str(elena.id),
+            "generated_at": datetime.now().isoformat(),
+            "timeline_status": "on_track",
+            "milestone_completion_percentage": 90.0,
+            "total_milestones": 10,
+            "completed_milestones": 9,
+            "pending_milestones": 1,
+            "total_delays": 2,
+            "overdue_milestones": 0,
+            "overdue_critical_milestones": 0,
+            "average_delay_days": 15.0,
+            "max_delay_days": 30,
+            "latest_health_score": 4.5,
+            "health_dimensions": {
+                "momentum": 4.8,
+                "clarity": 5.0,
+                "support": 4.5,
+                "confidence": 4.3,
+                "work_life_balance": 3.5,
+                "finishing_anxiety": 3.8
+            },
+            "longitudinal_summary": {
+                "trend": "positive",
+                "velocity": "excellent",
+                "completion_forecast": "2026-05-15",
+                "achievements": [
+                    "3 papers published",
+                    "dissertation 90% complete",
+                    "job offers received"
+                ]
+            }
+        }
+    )
+    db.add(analytics_snapshot)
+    
     db.commit()
     print("✓ Late-stage PhD created: Elena Rodriguez")
     print("  - 4.5 years in, nearing completion")
     print("  - Dissertation 90% complete")
     print("  - Job interviews secured")
+    print("  - Analytics: 90% complete, on track")
 
 
 def main():

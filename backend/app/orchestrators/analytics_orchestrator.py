@@ -18,6 +18,9 @@ from app.services.analytics_engine import (
 )
 from app.models.progress_event import ProgressEvent
 from app.models.journey_assessment import JourneyAssessment
+from app.models.timeline_stage import TimelineStage
+from app.models.timeline_milestone import TimelineMilestone
+from app.models.idempotency import DecisionTrace, EvidenceBundle
 
 
 class AnalyticsOrchestratorError(Exception):
@@ -39,7 +42,31 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
     - Idempotent analytics generation
     - Decision tracing
     - Evidence bundling
+    
+    READ-ONLY CONTRACT:
+    - Only READS from: CommittedTimeline, ProgressEvent, JourneyAssessment
+    - Only WRITES to: AnalyticsSnapshot, DecisionTrace/EvidenceBundle
+    - NO mutations to upstream state
+    - Enforced via _validate_read_only_contract()
     """
+    
+    # Allowed models for READ operations
+    _ALLOWED_READ_MODELS = {
+        'User',
+        'CommittedTimeline',
+        'TimelineStage',
+        'TimelineMilestone',
+        'ProgressEvent',
+        'JourneyAssessment',
+        'DraftTimeline',
+    }
+    
+    # Allowed models for WRITE operations
+    _ALLOWED_WRITE_MODELS = {
+        'AnalyticsSnapshot',
+        'DecisionTrace',
+        'EvidenceBundle',
+    }
     
     @property
     def orchestrator_name(self) -> str:
@@ -56,6 +83,8 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         """
         super().__init__(db, user_id)
         self.analytics_engine = AnalyticsEngine(db)
+        self._read_operations = []  # Track read operations for validation
+        self._write_operations = []  # Track write operations for validation
     
     def run(
         self,
@@ -165,6 +194,10 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         Returns:
             Dashboard-ready JSON response
         """
+        # Reset operation tracking
+        self._read_operations = []
+        self._write_operations = []
+        
         user_id = UUID(context["user_id"])
         timeline_id = UUID(context["timeline_id"]) if context.get("timeline_id") else None
         
@@ -178,14 +211,15 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 timeline_id=timeline_id
             )
             
-            # Validate user exists
-            user = self.db.query(User).filter(User.id == user_id).first()
+            # Validate user exists (READ operation)
+            user = self._tracked_read(User, User.id == user_id).first()
             if not user:
                 raise AnalyticsOrchestratorError(f"User with ID {user_id} not found")
             
-            # Get committed timeline (latest if not specified)
+            # Get committed timeline (READ operation)
             if timeline_id:
-                committed_timeline = self.db.query(CommittedTimeline).filter(
+                committed_timeline = self._tracked_read(
+                    CommittedTimeline,
                     CommittedTimeline.id == timeline_id,
                     CommittedTimeline.user_id == user_id
                 ).first()
@@ -195,7 +229,8 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                     )
             else:
                 # Get latest committed timeline
-                committed_timeline = self.db.query(CommittedTimeline).filter(
+                committed_timeline = self._tracked_read(
+                    CommittedTimeline,
                     CommittedTimeline.user_id == user_id
                 ).order_by(CommittedTimeline.committed_date.desc()).first()
                 
@@ -223,32 +258,33 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         
         # Step 2: Load data (read-only, no mutations)
         with self._trace_step("load_data") as step:
-            # Get all milestones for this timeline to find progress events
-            from app.models.timeline_stage import TimelineStage
-            from app.models.timeline_milestone import TimelineMilestone
-            
-            stages = self.db.query(TimelineStage).filter(
+            # Get all milestones for this timeline to find progress events (READ operations)
+            stages = self._tracked_read(
+                TimelineStage,
                 TimelineStage.committed_timeline_id == committed_timeline.id
             ).all()
             
             milestone_ids = []
             for stage in stages:
-                milestones = self.db.query(TimelineMilestone).filter(
+                milestones = self._tracked_read(
+                    TimelineMilestone,
                     TimelineMilestone.timeline_stage_id == stage.id
                 ).all()
                 milestone_ids.extend([m.id for m in milestones])
             
-            # Load ProgressEvents (read-only)
+            # Load ProgressEvents (READ operation)
             if milestone_ids:
-                progress_events = self.db.query(ProgressEvent).filter(
+                progress_events = self._tracked_read(
+                    ProgressEvent,
                     ProgressEvent.user_id == user_id,
                     ProgressEvent.milestone_id.in_(milestone_ids)
                 ).order_by(ProgressEvent.event_date.asc()).all()
             else:
                 progress_events = []
             
-            # Load latest JourneyAssessment (read-only)
-            latest_assessment = self.db.query(JourneyAssessment).filter(
+            # Load latest JourneyAssessment (READ operation)
+            latest_assessment = self._tracked_read(
+                JourneyAssessment,
                 JourneyAssessment.user_id == user_id
             ).order_by(JourneyAssessment.assessment_date.desc()).first()
             
@@ -297,7 +333,7 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 confidence=1.0
             )
         
-        # Step 4: Persist AnalyticsSnapshot
+        # Step 4: Persist AnalyticsSnapshot (WRITE operation)
         with self._trace_step("persist_analytics_snapshot") as step:
             # Get timeline version from draft_timeline if available
             timeline_version = self._extract_timeline_version(committed_timeline)
@@ -323,11 +359,14 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
                 confidence=1.0
             )
         
-        # Step 5: Write DecisionTrace (automatic via BaseOrchestrator.execute())
+        # Step 5: Validate read-only contract
+        self._validate_read_only_contract()
+        
+        # Step 6: Write DecisionTrace (automatic via BaseOrchestrator.execute())
         # The BaseOrchestrator.execute() method automatically writes DecisionTrace
         # after _execute_pipeline completes successfully
         
-        # Step 6: Return dashboard-ready JSON
+        # Step 7: Return dashboard-ready JSON
         dashboard_json = self._build_dashboard_json_from_summary(
             analytics_summary=analytics_summary,
             snapshot_id=snapshot_id
@@ -354,7 +393,8 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
         # Try to get version from draft_timeline
         if committed_timeline.draft_timeline_id:
             from app.models.draft_timeline import DraftTimeline
-            draft = self.db.query(DraftTimeline).filter(
+            draft = self._tracked_read(
+                DraftTimeline,
                 DraftTimeline.id == committed_timeline.draft_timeline_id
             ).first()
             if draft and draft.version_number:
@@ -409,14 +449,14 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
             "longitudinal_summary": analytics_summary.longitudinal_summary
         }
         
-        # Create snapshot record (immutable)
+        # Create snapshot record (immutable) using tracked write
         snapshot = AnalyticsSnapshot(
             user_id=user_id,
             timeline_version=timeline_version,
             summary_json=summary_json
         )
         
-        self.db.add(snapshot)
+        self._tracked_write(snapshot)
         self.db.commit()
         self.db.refresh(snapshot)
         
@@ -604,3 +644,107 @@ class AnalyticsOrchestrator(BaseOrchestrator[Dict[str, Any]]):
             },
             "summary": analytics_report.summary
         }
+    
+    def _tracked_read(self, model, *filters):
+        """
+        Perform a tracked database read operation.
+        
+        Logs the model being read from and validates it's an allowed read model.
+        
+        Args:
+            model: SQLAlchemy model class
+            *filters: Query filters
+            
+        Returns:
+            SQLAlchemy query object
+        """
+        model_name = model.__name__
+        self._validate_read_operation(model_name)
+        self._read_operations.append(model_name)
+        return self.db.query(model).filter(*filters)
+    
+    def _tracked_write(self, instance):
+        """
+        Perform a tracked database write operation.
+        
+        Logs the model being written to and validates it's an allowed write model.
+        
+        Args:
+            instance: SQLAlchemy model instance
+        """
+        model_name = instance.__class__.__name__
+        self._validate_write_operation(model_name)
+        self._write_operations.append(model_name)
+        self.db.add(instance)
+    
+    def _validate_read_operation(self, model_name: str):
+        """
+        Validate a read operation is allowed.
+        
+        Args:
+            model_name: Name of the model being read
+            
+        Raises:
+            StateMutationInAnalyticsOrchestratorError: If read from non-allowed model
+        """
+        if model_name not in self._ALLOWED_READ_MODELS:
+            raise StateMutationInAnalyticsOrchestratorError(
+                f"AnalyticsOrchestrator attempted to read from non-allowed model: {model_name}. "
+                f"Allowed read models: {', '.join(sorted(self._ALLOWED_READ_MODELS))}"
+            )
+    
+    def _validate_write_operation(self, model_name: str):
+        """
+        Validate a write operation is allowed.
+        
+        Args:
+            model_name: Name of the model being written
+            
+        Raises:
+            StateMutationInAnalyticsOrchestratorError: If write to non-allowed model
+        """
+        if model_name not in self._ALLOWED_WRITE_MODELS:
+            raise StateMutationInAnalyticsOrchestratorError(
+                f"AnalyticsOrchestrator attempted to write to non-allowed model: {model_name}. "
+                f"Allowed write models: {', '.join(sorted(self._ALLOWED_WRITE_MODELS))}"
+            )
+    
+    def _validate_read_only_contract(self):
+        """
+        Validate the read-only contract was maintained during execution.
+        
+        Checks:
+        - All reads were from allowed models
+        - All writes were to allowed models
+        - No upstream state mutation occurred
+        
+        Raises:
+            StateMutationInAnalyticsOrchestratorError: If contract violated
+        """
+        # Check all read operations
+        invalid_reads = [op for op in self._read_operations if op not in self._ALLOWED_READ_MODELS]
+        if invalid_reads:
+            raise StateMutationInAnalyticsOrchestratorError(
+                f"AnalyticsOrchestrator violated read-only contract. "
+                f"Invalid read operations: {', '.join(set(invalid_reads))}. "
+                f"Allowed read models: {', '.join(sorted(self._ALLOWED_READ_MODELS))}"
+            )
+        
+        # Check all write operations
+        invalid_writes = [op for op in self._write_operations if op not in self._ALLOWED_WRITE_MODELS]
+        if invalid_writes:
+            raise StateMutationInAnalyticsOrchestratorError(
+                f"AnalyticsOrchestrator violated read-only contract. "
+                f"Invalid write operations: {', '.join(set(invalid_writes))}. "
+                f"Allowed write models: {', '.join(sorted(self._ALLOWED_WRITE_MODELS))}"
+            )
+
+
+class StateMutationInAnalyticsOrchestratorError(Exception):
+    """
+    Exception raised when AnalyticsOrchestrator violates read-only contract.
+    
+    This indicates the orchestrator attempted to mutate upstream state,
+    which violates the analytics-only constraint.
+    """
+    pass
